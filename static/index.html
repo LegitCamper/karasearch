@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Karasearch - Your corner of the web</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Library navigation">
+      <a href="/" class="brand"><span class="brand-mark" aria-hidden="true">k.</span>karasearch<span class="brand-dot">/</span></a>
+      <p class="eyebrow sidebar-caption">A little less internet.<br>A little more yours.</p>
+      <div id="library-nav" hidden>
+        <p class="nav-label">YOUR LIBRARY</p>
+        <button class="nav-item active" id="all-bookmarks" type="button">All bookmarks <span aria-hidden="true">/</span></button>
+        <button class="nav-item" id="pinned-bookmarks" type="button">Pinned <span aria-hidden="true">*</span></button>
+        <div class="tag-heading"><p class="nav-label">COLLECTIONS BY TAG</p></div>
+        <div id="tag-list" class="tag-list"></div>
+        <button id="more-tags" class="quiet-button" type="button" hidden>More tags</button>
+      </div>
+      <div class="sidebar-bottom"><span class="status-dot" aria-hidden="true"></span><span id="connection-label">Your Karakeep, connected.</span><p>No feeds. No distractions.</p></div>
+    </aside>
+
+    <main id="main">
+      <header class="topbar"><span class="eyebrow" id="date-label">YOUR PERSONAL START PAGE</span><div id="account-actions" hidden><span id="account-name"></span><button id="customize" class="quiet-button" type="button">Customize</button><button id="logout" class="quiet-button" type="button">Sign out</button></div></header>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+      <section id="login-view" class="login-view" hidden>
+        <div class="login-intro"><p class="eyebrow accent">BOOKMARKS, WITH ROOM TO BREATHE</p><h1>Your corner<br>of the web<span class="accent">.</span></h1><p class="intro">Everything worth keeping.<br>One quiet place to find it again.</p><div class="intro-rule"></div><p class="small-note">Powered by your Karakeep library.<br>Search the web only when you choose.</p></div>
+        <form id="login-form" class="login-card"><span class="step-label">01 / MAKE YOURSELF AT HOME</span><h2>Connect your library</h2><p>Sign in using a Karakeep API key. Create one in Karakeep's Settings &gt; API Keys.</p><label for="api-key">Karakeep API key</label><input id="api-key" name="api_key" type="password" autocomplete="off" required maxlength="4096" placeholder="Paste your API key"><button class="primary-button" type="submit">Connect to Karakeep <span aria-hidden="true">&rarr;</span></button><p class="small-note">Key stays in server memory, never browser storage. Sessions expire after 12 hours or a server restart. Bookmark and tag write access enables editing.</p></form>
+      </section>
+
+      <section id="home-view" hidden>
+        <section class="hero"><p class="eyebrow accent">A PLACE FOR YOUR GOOD FINDS</p><h1 id="greeting">Make room for curiosity.</h1><p class="intro">Find something you saved. Or something you haven't.</p>
+          <div class="search-shell"><form id="search-form" class="search-box" role="search"><label class="sr-only" for="search-input">Search query</label><span class="search-symbol" aria-hidden="true">&#9906;</span><input id="search-input" type="search" placeholder="Where would you like to go?" maxlength="2048" autocomplete="off"><label class="sr-only" for="search-engine">Search destination</label><select id="search-engine"></select><button type="submit" class="search-submit" aria-label="Search">&rarr;</button></form><div id="suggestions" class="suggestions" role="listbox" aria-label="Search suggestions" hidden></div></div>
+          <div class="search-hint"><span id="search-hint">Search stays in your Karakeep library.</span><span><kbd>/</kbd> to focus &middot; <kbd>&darr;</kbd> for suggestions</span></div>
+        </section>
+        <section class="pinned-section" aria-labelledby="pinned-heading"><div class="section-top"><h2 id="pinned-heading">Within reach</h2><span class="eyebrow">YOUR BOOKMARK BAR</span></div><div id="folder-bar" class="bookmark-bar folder-bar"></div><div id="bookmark-bar" class="bookmark-bar"></div></section>
+        <section class="library-section" aria-labelledby="library-heading"><div class="section-top library-top"><div><p class="eyebrow accent" id="collection-caption">THE THINGS YOU KEEP</p><h2 id="library-heading">All bookmarks</h2></div><div class="library-actions"><button class="quiet-button" id="refresh" type="button">Refresh</button><button class="outline-button" id="add-bookmark" type="button">+ Save a link</button></div></div><p id="result-status" class="small-note" role="status"></p><div id="bookmark-grid" class="bookmark-grid" aria-busy="false"></div><button id="load-more" class="outline-button load-more" type="button" hidden>Load more bookmarks</button></section>
+        <footer>Collected with intention. <span>Karasearch / Your web, on your terms.</span></footer>
+      </section>
+      <p id="boot-status" class="small-note">Connecting to your start page...</p>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-heading"><form id="settings-form"><div class="dialog-heading"><h2 id="settings-heading">Make it yours</h2><button type="button" class="close-button" data-close aria-label="Close settings">&times;</button></div><label for="setting-greeting">Homepage heading</label><input id="setting-greeting" maxlength="100" required><div class="form-columns"><div><label for="setting-theme">Appearance</label><select id="setting-theme"><option value="light">Paper</option><option value="dark">After hours</option><option value="latte">Catppuccin Latte</option><option value="frappe">Catppuccin Frapp&eacute;</option><option value="macchiato">Catppuccin Macchiato</option><option value="mocha">Catppuccin Mocha</option><option value="dracula">Dracula</option></select></div><div><label for="setting-density">Bookmark layout</label><select id="setting-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></div></div><label for="setting-engines">Search engines</label><p class="small-note" id="engine-help">One per line: Name | URL with {query}. Use your browser-reachable Private Search URL. Only HTTP(S) URLs are allowed.</p><textarea id="setting-engines" rows="5" aria-describedby="engine-help" required spellcheck="false"></textarea><p class="small-note">Preferences stay in this browser, separately for each Karakeep user. Pins and tags sync through Karakeep.</p><p class="form-error" role="alert"></p><button type="submit" class="primary-button">Save preferences</button></form></dialog>
+
+  <dialog id="save-dialog" aria-labelledby="save-heading"><form id="save-form"><div class="dialog-heading"><h2 id="save-heading">Keep a good find</h2><button type="button" class="close-button" data-close aria-label="Close save link">&times;</button></div><label for="bookmark-url">URL</label><input id="bookmark-url" type="url" placeholder="https://" required maxlength="8192"><label for="bookmark-title">Title (optional)</label><input id="bookmark-title" maxlength="500"><p class="form-error" role="alert"></p><button type="submit" class="primary-button">Save to Karakeep</button></form></dialog>
+
+  <dialog id="tags-dialog" aria-labelledby="tags-heading"><div class="dialog-heading"><h2 id="tags-heading">Organize this bookmark</h2><button type="button" class="close-button" data-close aria-label="Close tags">&times;</button></div><p id="tag-bookmark-title" class="small-note"></p><div id="editable-tags" class="card-tags"></div><form id="tag-form"><label for="new-tag">Add a tag</label><input id="new-tag" maxlength="100" required placeholder="e.g. inspiration"><p class="form-error" role="alert"></p><button type="submit" class="primary-button">Add tag</button></form></dialog>
+</body>
+</html>
