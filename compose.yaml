@@ -7,6 +7,10 @@ services:
       KARAKEEP_URL: ${KARAKEEP_URL:-http://host.docker.internal:3000}
       SEARCH_URL: ${SEARCH_URL:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SESSION_STORE: /data/sessions.enc
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env to a stable random secret}
+    volumes:
+      - sessions:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -15,3 +19,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  sessions:

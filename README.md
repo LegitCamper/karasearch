@@ -31,14 +31,28 @@ The Private Search default matches `../private-search`: port 8080, `/search?q=..
 | `BIND_ADDR` | `127.0.0.1:8787` | Listener address |
 | `SEARCH_URL` | `http://localhost:8080/search?q={query}&t=general` | Initial external engine template |
 | `COOKIE_SECURE` | `false` | Set `true` behind HTTPS |
+| `SESSION_STORE` | unset | Optional encrypted session file; Compose sets `/data/sessions.enc` |
+| `SESSION_SECRET` | unset | Stable random secret (at least 32 characters), required with `SESSION_STORE` |
 
 The binary reads environment variables, not `.env` files. Docker Compose reads `.env` for interpolation. Empty or unset `SEARCH_URL` uses the default. Existing browser preferences override `SEARCH_URL` after customization.
 
 ## Container
 
+Generate a secret once with `openssl rand -hex 32`, then put `SESSION_SECRET=<generated value>` in your `.env` file (gitignored). Keep existing `.env` settings and restrict its permissions with `chmod 600 .env`. Compose requires this secret before starting.
+
 ```sh
 docker compose up --build -d
 ```
+
+### Sessions across restarts
+
+Compose mounts the named `sessions` volume at `/data`, writable by the container's non-root user (UID 10001); the rest of the filesystem stays read-only. Sessions and their Karakeep API keys are encrypted with ChaCha20-Poly1305, using a key derived from `SESSION_SECRET`. A hash cannot replace the upstream API key: Karakeep requires the original bearer token on each request.
+
+Keep the same secret and volume when recreating containers. Sessions keep their original **12-hour expiry**; a restart does not extend it. Logout persists removal before reporting success. Failed saves return errors instead of claiming that login/logout succeeded. Wrong secrets, corrupt files, and unwritable storage stop startup rather than silently discarding sessions. Existing memory-only sessions need one new login after enabling storage.
+
+Keep the secret outside the session volume. Back up both separately; anyone with both can recover API keys. Encryption does not protect against someone who controls the host or running container. `docker compose down` preserves the volume; **`docker compose down -v` deletes saved sessions**. Do not rotate the secret without deliberately resetting the session file and signing everyone in again.
+
+For native runs, create a private writable directory, set `SESSION_STORE` to a file inside it, and supply the same `SESSION_SECRET` on every run. Bind mounts must be writable by UID 10001. Run only one Karasearch process per session file; this is not a shared store for replicas. Leave `SESSION_STORE` unset for the simpler memory-only mode.
 
 Compose connects to Karakeep's host-published port 3000 through `host.docker.internal`. This requires that port to be reachable from the container network. If Karakeep is in another Compose stack, preferably join Karasearch to its Docker network and set `KARAKEEP_URL=http://<karakeep-service>:3000`. Do not use `localhost` to refer to another container. Change the port to match your setup. No Karakeep volumes or database files are mounted.
 
@@ -60,7 +74,7 @@ Queries are URL-encoded before substitution. Search engines are not proxied. Boo
 
 ## Deliberate limits
 
-- API keys live only in server memory. Opaque HttpOnly/SameSite cookies expire after 12 hours; restart signs everyone out. Logout removes the session, not the upstream API key. Sessions are capped at 1,024. A new login replaces that browser's previous session.
+- API keys stay server-side, encrypted on disk when `SESSION_STORE` is set, otherwise only in memory. Opaque HttpOnly/SameSite cookies expire after 12 hours. Without persistence, restart signs everyone out. Logout removes the session, not the upstream API key. Sessions are capped at 1,024. A new login replaces that browser's previous session.
 - Mutations require a custom same-origin header; no cross-origin API access is enabled. Upstream redirects are disabled to prevent forwarding credentials to another host. The upstream host is operator-configured, never supplied by the login form.
 - Preferences live in browser local storage, keyed by Karakeep user ID. They do not sync between devices. Favourites and tags do sync because Karakeep owns them. Pinning changes your Karakeep favourites, not a separate list.
 - Folders are read-only here: lists are created, renamed, and filled in Karakeep. Each folder loads its first 40 bookmarks on first open and caches them until refresh; smart lists work because Karakeep resolves the query.

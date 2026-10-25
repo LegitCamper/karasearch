@@ -12,6 +12,7 @@ fn app(upstream: &str) -> App {
         search_url: "http://localhost:8080/search?q={query}".into(),
         secure_cookie: false,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        store: None,
     }
 }
 
@@ -45,6 +46,151 @@ fn reject_unsafe_urls_and_path_traversal() {
         assert!(identifier(value).is_err());
     }
     assert!(identifier("bookmark-123_abc").is_ok());
+}
+
+#[test]
+fn encrypted_store_survives_restart_and_rejects_a_changed_secret() {
+    let path = env::temp_dir().join(format!("karasearch-test-{}.bin", Uuid::new_v4()));
+    let secret = "0123456789abcdef0123456789abcdef";
+    assert!(Store::new(path.clone(), "too-short").is_err());
+    let store = Store::new(path.clone(), secret).unwrap();
+    assert!(
+        store.load().unwrap().is_empty(),
+        "missing file is not an error"
+    );
+
+    let mut sessions = HashMap::new();
+    sessions.insert(
+        "token-live".to_owned(),
+        Session {
+            key: "secret-api-key".to_owned(),
+            expires: now() + 600,
+        },
+    );
+    sessions.insert(
+        "token-stale".to_owned(),
+        Session {
+            key: "expired-api-key".to_owned(),
+            expires: now() - 1,
+        },
+    );
+    store.save(&sessions).unwrap();
+
+    let sealed = std::fs::read(&path).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    store.save(&sessions).unwrap();
+    assert_ne!(
+        sealed,
+        std::fs::read(&path).unwrap(),
+        "each save uses a fresh nonce"
+    );
+    assert!(
+        !String::from_utf8_lossy(&sealed).contains("secret-api-key"),
+        "API key must not be readable on disk"
+    );
+
+    let restored = Store::new(path.clone(), secret).unwrap().load().unwrap();
+    assert_eq!(restored.len(), 1, "expired sessions are dropped on load");
+    assert_eq!(restored["token-live"].key, "secret-api-key");
+
+    let other = Store::new(path.clone(), "fedcba9876543210fedcba9876543210").unwrap();
+    assert!(other.load().is_err(), "a different secret must not decrypt");
+
+    let mut tampered = sealed.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, &tampered).unwrap();
+    assert!(
+        Store::new(path.clone(), secret).unwrap().load().is_err(),
+        "tampering must fail authentication"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
+    let mock = Router::new().route(
+        "/api/v1/users/me",
+        get(|headers: HeaderMap| async move {
+            Json(json!({"id": headers[header::AUTHORIZATION].to_str().unwrap()}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let path = env::temp_dir().join(format!("karasearch-test-{}.enc", Uuid::new_v4()));
+    let secret = "0123456789abcdef0123456789abcdef";
+    let store = Arc::new(Store::new(path.clone(), secret).unwrap());
+    let mut state = app(&format!("http://{address}/api/v1/"));
+    state.store = Some(store.clone());
+    let mut cookies = Vec::new();
+    for key in ["alice-key", "bob-key"] {
+        let response = router(state.clone())
+            .oneshot(request("POST", "/api/login", "", json!({"api_key": key})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        cookies.push(
+            response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let before = store.load().unwrap();
+    state.sessions = Arc::new(Mutex::new(store.load().unwrap()));
+    for (cookie, key) in cookies.iter().zip(["alice-key", "bob-key"]) {
+        let response = router(state.clone())
+            .oneshot(request("GET", "/api/me", cookie, Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["id"], format!("Bearer {key}"));
+    }
+    for (token, session) in state.sessions.lock().unwrap().iter() {
+        assert_eq!(
+            session.expires, before[token].expires,
+            "restart must not extend expiry"
+        );
+    }
+    let mut failing = state.clone();
+    failing.store = Some(Arc::new(
+        Store::new(path.join("missing/sessions.enc"), secret).unwrap(),
+    ));
+    for (route, body) in [
+        ("logout", Value::Null),
+        ("login", json!({"api_key": "replacement-key"})),
+    ] {
+        let response = router(failing.clone())
+            .oneshot(request("POST", &format!("/api/{route}"), &cookies[0], body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(state.sessions.lock().unwrap().len(), 2);
+        assert_eq!(store.load().unwrap().len(), 2);
+    }
+    let response = router(state.clone())
+        .oneshot(request("POST", "/api/logout", &cookies[0], Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    state.sessions = Arc::new(Mutex::new(store.load().unwrap()));
+    let response = router(state.clone())
+        .oneshot(request("GET", "/api/me", &cookies[0], Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = router(state)
+        .oneshot(request("GET", "/api/me", &cookies[1], Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    fs::remove_file(path).unwrap();
+    server.abort();
 }
 
 #[test]
@@ -143,7 +289,7 @@ async fn expired_session_is_removed() {
         "expired".into(),
         Session {
             key: "secret".into(),
-            expires: Instant::now() - Duration::from_secs(1),
+            expires: now() - 1,
         },
     );
     let response = router(state.clone())

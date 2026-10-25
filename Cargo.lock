@@ -466,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

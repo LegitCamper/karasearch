@@ -1,8 +1,11 @@
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -14,11 +17,133 @@ use axum::{
     routing::{get, patch, post},
 };
 use reqwest::{Client, Url};
+use ring::{
+    aead::{self, Nonce, UnboundKey},
+    hkdf,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SESSION_SECONDS: u64 = 43_200;
+const NONCE_LEN: usize = 12;
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+struct Store {
+    path: PathBuf,
+    key: [u8; 32],
+}
+
+impl Store {
+    fn new(path: PathBuf, secret: &str) -> Result<Self, String> {
+        if secret.len() < 32 {
+            return Err("SESSION_SECRET must be at least 32 characters".into());
+        }
+        let mut key = [0u8; 32];
+        hkdf::Salt::new(hkdf::HKDF_SHA256, b"karasearch session store v1")
+            .extract(secret.as_bytes())
+            .expand(&[b"sessions"], hkdf::HKDF_SHA256)
+            .and_then(|okm| okm.fill(&mut key))
+            .map_err(|_| "Could not derive the session encryption key".to_owned())?;
+        Ok(Self { path, key })
+    }
+
+    fn cipher(&self) -> Result<aead::LessSafeKey, String> {
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &self.key)
+            .map(aead::LessSafeKey::new)
+            .map_err(|_| "Invalid session encryption key".to_owned())
+    }
+
+    fn load(&self) -> Result<HashMap<String, Session>, String> {
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(format!("Could not read {}: {error}", self.path.display())),
+        };
+        let mut sealed = Vec::new();
+        file.take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut sealed)
+            .map_err(|error| format!("Could not read session store: {error}"))?;
+        if sealed.len() > 16 * 1024 * 1024 {
+            return Err("Session store exceeds 16 MiB".into());
+        }
+        if sealed.len() <= NONCE_LEN {
+            return Err("Session store file is truncated".into());
+        }
+        let (nonce, body) = sealed.split_at(NONCE_LEN);
+        let mut buffer = body.to_vec();
+        let plain = self
+            .cipher()?
+            .open_in_place(
+                Nonce::try_assume_unique_for_key(nonce)
+                    .map_err(|_| "Invalid session store nonce".to_owned())?,
+                aead::Aad::empty(),
+                &mut buffer,
+            )
+            .map_err(|_| {
+                "Could not decrypt the session store; SESSION_SECRET likely changed".to_owned()
+            })?;
+        let records: Vec<(String, String, u64)> =
+            serde_json::from_slice(plain).map_err(|_| "Session store is corrupt".to_owned())?;
+        if records.len() > 1024 {
+            return Err("Session store exceeds session capacity".into());
+        }
+        Ok(records
+            .into_iter()
+            .filter(|(_, _, expires)| *expires > now())
+            .map(|(token, key, expires)| (token, Session { key, expires }))
+            .collect())
+    }
+
+    fn save(&self, sessions: &HashMap<String, Session>) -> Result<(), String> {
+        let records: Vec<(&String, &String, u64)> = sessions
+            .iter()
+            .map(|(token, session)| (token, &session.key, session.expires))
+            .collect();
+        let mut buffer = serde_json::to_vec(&records).map_err(|_| "Could not encode sessions")?;
+        let mut nonce = [0u8; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "Could not generate a nonce".to_owned())?;
+        self.cipher()?
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                aead::Aad::empty(),
+                &mut buffer,
+            )
+            .map_err(|_| "Could not encrypt sessions".to_owned())?;
+        let temporary = self.path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("Could not open {}: {error}", temporary.display()))?;
+        let result = file
+            .write_all(&nonce)
+            .and_then(|()| file.write_all(&buffer))
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temporary, &self.path))
+            .and_then(|()| {
+                let parent = self
+                    .path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty());
+                fs::File::open(parent.unwrap_or_else(|| std::path::Path::new(".")))?.sync_all()
+            });
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|error| format!("Could not persist {}: {error}", self.path.display()))
+    }
+}
 
 #[derive(Clone)]
 struct App {
@@ -26,13 +151,15 @@ struct App {
     upstream: Url,
     search_url: String,
     secure_cookie: bool,
-    // ponytail: in-memory sessions; add a shared store only for restart persistence or replicas.
+    // ponytail: single-process store; add Redis/Postgres only when running replicas.
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    store: Option<Arc<Store>>,
 }
 
+#[derive(Clone)]
 struct Session {
     key: String,
-    expires: Instant,
+    expires: u64,
 }
 
 struct ApiError(StatusCode, &'static str);
@@ -78,7 +205,7 @@ impl App {
                 "Session store unavailable",
             )
         })?;
-        sessions.retain(|_, session| session.expires > Instant::now());
+        sessions.retain(|_, session| session.expires > now());
         session_id(headers)
             .and_then(|id| sessions.get(id))
             .map(|session| session.key.clone())
@@ -86,6 +213,42 @@ impl App {
                 StatusCode::UNAUTHORIZED,
                 "Sign in with your Karakeep API key",
             ))
+    }
+
+    async fn update_sessions(
+        &self,
+        change: impl FnOnce(&mut HashMap<String, Session>) -> ApiResult<()> + Send + 'static,
+    ) -> ApiResult<()> {
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sessions = app.sessions.lock().map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Session store unavailable",
+                )
+            })?;
+            let mut updated = sessions.clone();
+            updated.retain(|_, session| session.expires > now());
+            change(&mut updated)?;
+            if let Some(store) = &app.store {
+                store.save(&updated).map_err(|error| {
+                    eprintln!("karasearch: {error}");
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Could not save session changes; retry",
+                    )
+                })?;
+            }
+            *sessions = updated;
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session store unavailable",
+            )
+        })?
     }
 
     async fn request(
@@ -214,47 +377,40 @@ async fn login(
         ));
     }
     let token = Uuid::new_v4().to_string();
-    let mut sessions = app.sessions.lock().map_err(|_| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Session store unavailable",
-        )
-    })?;
-    sessions.retain(|_, session| session.expires > Instant::now());
-    if let Some(previous) = session_id(&headers) {
-        sessions.remove(previous);
-    }
-    if sessions.len() >= 1024 {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Session capacity reached",
-        ));
-    }
-    sessions.insert(
-        token.clone(),
-        Session {
-            key: key.to_owned(),
-            expires: Instant::now() + Duration::from_secs(SESSION_SECONDS),
-        },
-    );
-    Ok((
-        [(header::SET_COOKIE, app.cookie(&token, SESSION_SECONDS))],
-        Json(user),
-    )
-        .into_response())
+    let cookie = app.cookie(&token, SESSION_SECONDS);
+    let previous = session_id(&headers).map(str::to_owned);
+    let key = key.to_owned();
+    app.update_sessions(move |sessions| {
+        if let Some(previous) = previous {
+            sessions.remove(&previous);
+        }
+        if sessions.len() >= 1024 {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session capacity reached",
+            ));
+        }
+        sessions.insert(
+            token,
+            Session {
+                key,
+                expires: now() + SESSION_SECONDS,
+            },
+        );
+        Ok(())
+    })
+    .await?;
+    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
 }
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
     if let Some(token) = session_id(&headers) {
-        app.sessions
-            .lock()
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Session store unavailable",
-                )
-            })?
-            .remove(token);
+        let token = token.to_owned();
+        app.update_sessions(move |sessions| {
+            sessions.remove(&token);
+            Ok(())
+        })
+        .await?;
     }
     Ok((
         [(header::SET_COOKIE, app.cookie("", 0))],
@@ -504,6 +660,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("false") | Err(env::VarError::NotPresent) => false,
         _ => return Err("COOKIE_SECURE must be true or false".into()),
     };
+    let store = match env::var("SESSION_STORE").ok().filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let secret = env::var("SESSION_SECRET")
+                .map_err(|_| "SESSION_STORE needs SESSION_SECRET set to a random value")?;
+            Some(Arc::new(Store::new(PathBuf::from(path), &secret)?))
+        }
+        None => None,
+    };
+    let sessions = match &store {
+        Some(store) => {
+            let sessions = store.load()?;
+            store.save(&sessions)?;
+            sessions
+        }
+        None => HashMap::new(),
+    };
+    if !sessions.is_empty() {
+        println!("Karasearch restored {} session(s)", sessions.len());
+    }
     let app = App {
         client: Client::builder()
             .timeout(Duration::from_secs(15))
@@ -512,7 +687,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream,
         search_url,
         secure_cookie,
-        sessions: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(sessions)),
+        store,
     };
     let address = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
