@@ -12,4 +12,5 @@ RUN mkdir /data && chown 10001:10001 /data && chmod 700 /data
 USER 10001:10001
 ENV BIND_ADDR=0.0.0.0:8787
 EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["karasearch", "healthcheck"]
 ENTRYPOINT ["karasearch"]

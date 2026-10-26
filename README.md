@@ -36,6 +36,10 @@ The Private Search default matches `../private-search`: port 8080, `/search?q=..
 
 The binary reads environment variables, not `.env` files. Docker Compose reads `.env` for interpolation. Empty or unset `SEARCH_URL` uses the default. Existing browser preferences override `SEARCH_URL` after customization.
 
+## Health check
+
+`GET /healthz` returns `{"status":"ok"}` with no authentication. It reports only that the process serves HTTP; it never calls Karakeep, so a Karakeep outage will not restart a working container. The image declares a `HEALTHCHECK` that runs `karasearch healthcheck`, which requests `/healthz` over loopback and exits non-zero on failure, so no `curl` or `wget` is needed in the runtime image. Check status with `docker compose ps` or point an external monitor at the path.
+
 ## Container
 
 Generate a secret once with `openssl rand -hex 32`, then put `SESSION_SECRET=<generated value>` in your `.env` file (gitignored). Keep existing `.env` settings and restrict its permissions with `chmod 600 .env`. Compose requires this secret before starting.

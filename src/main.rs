@@ -618,6 +618,9 @@ fn router(app: App) -> Router {
         .route("/app.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../static/app.css")) }))
         .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../static/app.js")) }))
         .route("/api/config", get(|State(app): State<App>| async move { Json(json!({ "searchUrl": app.search_url })) }))
+        // Liveness only: no auth, no session counts, and no upstream call, so a Karakeep
+        // outage never restarts a healthy Karasearch.
+        .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
@@ -633,6 +636,24 @@ fn router(app: App) -> Router {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let address = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    // `karasearch healthcheck` keeps the runtime image free of curl/wget.
+    if env::args().nth(1).as_deref() == Some("healthcheck") {
+        let target = address
+            .replace("0.0.0.0", "127.0.0.1")
+            .replace("[::]", "[::1]");
+        let response = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?
+            .get(format!("http://{target}/healthz"))
+            .send()
+            .await?;
+        return if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("health check returned {}", response.status()).into())
+        };
+    }
     let upstream = env::var("KARAKEEP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
     let mut upstream = http_url(&upstream)?;
     if upstream.query().is_some() || upstream.fragment().is_some() {
@@ -690,7 +711,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions: Arc::new(Mutex::new(sessions)),
         store,
     };
-    let address = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("Karasearch listening on {address}");
     axum::serve(listener, router(app))

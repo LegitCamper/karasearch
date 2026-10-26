@@ -193,6 +193,35 @@ async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
     server.abort();
 }
 
+#[tokio::test]
+async fn health_endpoint_needs_no_session_and_no_upstream() {
+    // Upstream intentionally unreachable: liveness must not depend on Karakeep.
+    let router = router(app("http://127.0.0.1:1/api/v1/"));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["status"], "ok");
+
+    let private = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(private.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[test]
 fn routes_collections_to_upstream_paths() {
     let (path, _) = bookmark_query(Browse {
