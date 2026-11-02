@@ -59,4 +59,4 @@ const server = http.createServer(async (request, response) => {
   }
   send(405, { error: 'Method not allowed' });
 });
-server.listen(18787, '127.0.0.1', () => console.log('Test-only Karakeep fixture: http://127.0.0.1:18787; API key: test-key'));
+server.listen(Number(process.env.PORT || 18787), '127.0.0.1', () => console.log(`Test-only Karakeep fixture on port ${server.address().port}; API key: test-key`));

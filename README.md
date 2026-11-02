@@ -9,7 +9,7 @@ A small Rust homepage for a self-hosted Karakeep library. Axum serves the fronte
 - Live library search while typing, with a suggestion dropdown (first row is `your query (search)`).
 - Add/remove tags and save new links directly to Karakeep.
 - Customize the heading, theme (Paper, After hours, Catppuccin Latte/Frappe/Macchiato/Mocha, Dracula), compact layout, and search engines.
-- Show recently visited pages from [Hister](https://github.com/asciimoo/hister) on the front page, beside your bookmark bar.
+- Show recently indexed pages from [Hister](https://github.com/asciimoo/hister) on the front page, beside your bookmark bar.
 - Submit web searches to Private Search or any HTTP(S) search URL with a `{query}` placeholder. External search runs only on submit, not while typing.
 
 ## Run locally
@@ -45,7 +45,7 @@ The binary reads environment variables, not `.env` files. Docker Compose reads `
 
 ## Hister
 
-Set `HISTER_URL` to a Hister instance reachable **from the Rust server** to add a visited-pages section to the front page. Leave it unset and nothing changes: the token field is hidden and `/api/history` returns 404.
+Set `HISTER_URL` to a Hister instance reachable **from the Rust server** to add indexed pages and Hister search. When unset, the token field is hidden and `/api/history` returns 404; search explains that Hister is not configured.
 
 ```sh
 KARAKEEP_URL=http://127.0.0.1:3000 \
@@ -55,9 +55,11 @@ cargo run
 
 Hister owns its own accounts; Karasearch only stores a token for one of them. On a Hister server with `user_handling: true`, an administrator creates accounts with `POST /api/users` and reads each access token from `GET /api/users/{id}/token`; a user can rotate their own with `POST /api/users/{id}/token`. On a single-user server, the token is `app.access_token` from the Hister config. Paste that token in once at registration, or later under **Customize > Connected accounts**.
 
-Keys are validated before they are stored: Karasearch calls Karakeep's `users/me` and Hister's `api/profile`, and registration fails if either rejects its key, so a half-configured account is never saved. Both keys are checked again at each sign-in, so a revoked key is reported at the login form instead of as a broken home page. An account without a Hister token works fine; the visited-pages section stays hidden and history requests return 409.
+Keys are validated before they are stored: Karasearch calls Karakeep's `users/me` and Hister's `api/profile`, and registration fails if either rejects its key, so a half-configured account is never saved. Both keys are checked again at each sign-in, so a revoked key is reported at the login form instead of as a broken home page. An account without a Hister token works fine; the indexed-pages section stays hidden and history requests return 409. Search prompts that account to connect Hister.
 
-The front page reads `GET /api/history?opened=true`, which Hister answers with pages you navigated to. Only the first page (up to 100 records, 24 shown) is loaded; there is no history pagination, search, or deletion here. Use Hister's own interface for those.
+The front page reads `GET /api/history` for Hister's recently indexed documents (up to 100 records, 24 shown), not just links opened from Hister's search UI. Search also queries Hister's indexed documents through `GET /api/hister/search`, which proxies Hister's `/search?format=json` using your stored token. Search pages contain up to 40 records with an independent **More Hister results** button. There is no history deletion here.
+
+Search results and suggestions explicitly identify **Karakeep / bookmark** versus **Hister / indexed page**. **Save to Karakeep**, pins, and tags only write to Karakeep. Hister indexing remains managed by your Hister browser extension, crawler, or imports; Karasearch does not submit pages to Hister or discover browser history itself.
 
 **Session file format changed.** The store now holds accounts as well as sessions, so the encryption context moved to `v3`. An existing `SESSION_STORE` file from an earlier version will not decrypt, and startup stops with an error rather than discarding it silently. Delete that file once, then register again.
 
@@ -105,7 +107,7 @@ The default port mapping is loopback-only. For LAN access, deliberately change t
 
 ## Search and customization
 
-Choose **My bookmarks** for Karakeep search, or an engine for browser navigation. Karakeep's own query syntax is passed through unchanged. Selecting a tag browses that collection; submitting a search starts a library-wide search rather than silently filtering only loaded cards. `/` focuses search when not editing another field.
+Choose **Karakeep + Hister** to search both connected services, or an engine for browser navigation. Without a Hister connection, this option reads **Karakeep bookmarks**. Each service receives the query unchanged, so service-specific query syntax may produce different results. Results have separate source labels, counts, pagination, and error states; one service failing does not discard the other's results. Selecting a tag or folder still browses only Karakeep. `/` focuses search when not editing another field.
 
 Customize accepts one engine per line:
 
@@ -117,7 +119,7 @@ Google | https://www.google.com/search?q={query}
 
 ### Browser-native search
 
-`GET /?q=<query>` runs a library search on load. If your library returns nothing, the page redirects to the first configured engine, so an unmatched query still lands on the web. `/opensearch.xml` advertises that template (built from the request `Host`; the scheme follows `COOKIE_SECURE`), and `index.html` links to it, so browsers can add Karasearch as a search engine and give it a keyword. Signing in is still required; an unauthenticated `/?q=...` shows the login form, then runs the query after login.
+`GET /?q=<query>` searches both connected services on load. It redirects to the first configured web engine only after successful searches return no results from either source; an upstream failure is not treated as an empty result. `/opensearch.xml` advertises that template (built from the request `Host`; the scheme follows `COOKIE_SECURE`), and `index.html` links to it. Signing in is still required; an unauthenticated `/?q=...` shows the login form, then runs the query after login.
 
 Queries are URL-encoded before substitution. Search engines are not proxied. Bookmark URLs and labels are rendered without trusting HTML from Karakeep; there are no third-party fonts, favicons, scripts, or analytics requests.
 
@@ -128,7 +130,7 @@ Queries are URL-encoded before substitution. Search engines are not proxied. Boo
 - Mutations require a custom same-origin header; no cross-origin API access is enabled. Upstream redirects are disabled to prevent forwarding credentials to another host. The upstream host is operator-configured, never supplied by the login form.
 - Preferences live in browser local storage, keyed by Karakeep user ID. They do not sync between devices. Favourites and tags do sync because Karakeep owns them. Pinning changes your Karakeep favourites, not a separate list.
 - Folders are read-only here: lists are created, renamed, and filled in Karakeep. Each folder loads its first 40 bookmarks on first open and caches them until refresh; smart lists work because Karakeep resolves the query.
-- Live search queries only Karakeep, debounced 220 ms. The selected web engine is contacted only when you submit or pick the `(search)` suggestion row.
+- Live search queries Karakeep and connected Hister, debounced 220 ms. The selected web engine is contacted only when you submit or pick the `(search)` suggestion row.
 - The bar shows links among the first 40 favourites. **Pinned** provides paginated access to all favourites. Bookmark pages contain 40 records; tags load 100 at a time.
 - Notes/assets can appear in library results, but have no external link. This app is not a content reader or attachment viewer.
 - Static assets are embedded into the binary; restart `cargo run` after frontend edits.

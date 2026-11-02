@@ -24,6 +24,12 @@ export function parseEngines(text) {
 
 export const THEMES = ['light', 'dark', 'latte', 'frappe', 'macchiato', 'mocha', 'dracula'];
 
+export function histerInfo(document) {
+  const url = safeUrl(document.url);
+  const domain = url ? new URL(url).hostname.replace(/^www\./, '') : 'Indexed document';
+  return { url, domain, title: document.title || domain, description: document.text || '' };
+}
+
 export function engineUrl(template, query) {
   const destination = template.replaceAll('{query}', encodeURIComponent(query));
   if (!safeUrl(destination)) throw new Error('Invalid search engine URL. Update Customize settings.');
@@ -46,6 +52,9 @@ function start() {
   let editedBookmark = null;
   let allTags = [];
   let latest = [];
+  let histerLatest = [];
+  let histerCursor = null;
+  let histerShown = 0;
   let liveTimer = null;
 
   function notice(message = '') {
@@ -61,8 +70,13 @@ function start() {
     for (const id of ['home-view', 'library-nav', 'account-actions']) byId(id).hidden = true;
     clearTimeout(liveTimer);
     hideSuggestions();
-    for (const id of ['bookmark-grid', 'bookmark-bar', 'folder-bar', 'tag-list', 'editable-tags', 'history-list']) byId(id).replaceChildren();
+    for (const id of ['bookmark-grid', 'bookmark-bar', 'folder-bar', 'tag-list', 'editable-tags', 'history-list', 'hister-grid']) byId(id).replaceChildren();
     byId('history-section').hidden = true;
+    byId('hister-results').hidden = true;
+    latest = [];
+    histerLatest = [];
+    histerShown = 0;
+    histerCursor = null;
     byId('search-input').value = '';
     current = { title: 'All bookmarks', params: {} };
     allTags = [];
@@ -121,7 +135,7 @@ function start() {
     byId('greeting').textContent = preferences.greeting;
     const select = byId('search-engine');
     const previous = select.value;
-    select.replaceChildren(new Option('My bookmarks', 'bookmarks'), ...preferences.engines.map((engine, index) => new Option(engine.name, String(index))));
+    select.replaceChildren(new Option(user.histerConnected ? 'Karakeep + Hister' : 'Karakeep bookmarks', 'bookmarks'), ...preferences.engines.map((engine, index) => new Option(engine.name, String(index))));
     if ([...select.options].some(option => option.value === previous)) select.value = previous;
     updateHint();
   }
@@ -132,7 +146,8 @@ function start() {
   }
 
   function updateHint() {
-    byId('search-hint').textContent = byId('search-engine').value === 'bookmarks' ? `Typing searches your Karakeep library. The (search) row opens ${webEngine().name}.` : 'Submitting sends your query to the selected engine.';
+    const sources = user.histerConnected ? 'Karakeep bookmarks and Hister indexed pages' : 'Karakeep bookmarks';
+    byId('search-hint').textContent = `Typing searches ${sources}. Submitting ${byId('search-engine').value === 'bookmarks' ? 'keeps results here' : `opens ${webEngine().name}`}.`;
   }
 
   function preferenceKey() { return `karasearch:${user.id}:preferences`; }
@@ -151,10 +166,13 @@ function start() {
     byId('login-view').hidden = true;
     for (const id of ['home-view', 'library-nav', 'account-actions']) byId(id).hidden = false;
     byId('account-name').textContent = user.name || user.email || 'My library';
-    byId('connection-label').textContent = 'Connected to Karakeep.';
+    byId('connection-label').textContent = user.histerConnected ? 'Karakeep + Hister connected.' : 'Karakeep connected.';
     byId('search-input').focus();
     const wanted = new URLSearchParams(location.search).get('q');
-    if (wanted && wanted.trim()) return handoff(wanted.trim().slice(0, 2048));
+    if (wanted && wanted.trim()) {
+      try { await handoff(wanted.trim().slice(0, 2048)); } catch (error) { notice(error.message); }
+      return;
+    }
     await refresh();
   }
 
@@ -162,8 +180,11 @@ function start() {
   async function handoff(query) {
     byId('search-input').value = query;
     history.replaceState(null, '', '/');
-    await Promise.all([selectCollection(`Results for "${query}"`, { q: query }), loadPins(), loadTags(), loadLists(), loadHistory()]);
-    if (!shown) window.location.assign(engineUrl(preferences.engines[0].template, query));
+    const owner = user;
+    const results = selectCollection(`Results for "${query}"`, { q: query });
+    const requestGeneration = generation;
+    await Promise.all([results, loadPins(), loadTags(), loadLists(), loadHistory()]);
+    if (owner === user && requestGeneration === generation && !shown && !histerShown) window.location.assign(engineUrl(preferences.engines[0].template, query));
   }
 
   async function refresh() {
@@ -173,6 +194,8 @@ function start() {
   }
 
   async function selectCollection(title, params) {
+    clearTimeout(liveTimer);
+    hideSuggestions();
     current = { title, params };
     byId('search-input').value = params.q || '';
     byId('search-engine').value = 'bookmarks';
@@ -181,15 +204,26 @@ function start() {
   }
 
   async function loadBookmarks(more = false) {
+    if (more) return loadKarakeepBookmarks(true);
+    const owner = user;
+    const bookmarks = loadKarakeepBookmarks();
+    const requestGeneration = generation;
+    const results = await Promise.allSettled([bookmarks, loadHisterSearch()]);
+    if (owner !== user || requestGeneration !== generation) return;
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason.message);
+    if (errors.length) throw new Error(errors.join(' '));
+  }
+
+  async function loadKarakeepBookmarks(more = false) {
     const requestGeneration = more ? generation : ++generation;
     const query = new URLSearchParams(current.params);
     if (more && cursor) query.set('cursor', cursor);
     const grid = byId('bookmark-grid');
     grid.setAttribute('aria-busy', 'true');
     byId('load-more').hidden = true;
-    if (!more) { grid.replaceChildren(); shown = 0; cursor = null; }
+    if (!more) { grid.replaceChildren(); shown = 0; cursor = null; latest = []; }
     byId('library-heading').textContent = current.title;
-    byId('result-status').textContent = 'Finding your bookmarks...';
+    byId('result-status').textContent = 'Searching Karakeep...';
     byId('all-bookmarks').classList.toggle('active', !Object.keys(current.params).length);
     byId('pinned-bookmarks').classList.toggle('active', current.params.favourited === 'true');
     for (const element of byId('tag-list').children) element.classList.toggle('active', element.dataset.tag === current.params.tag);
@@ -201,15 +235,58 @@ function start() {
       shown += data.bookmarks.length;
       for (const bookmark of data.bookmarks) grid.append(bookmarkCard(bookmark));
       if (!shown) grid.append(node('div', 'empty-state', current.params.q ? 'Nothing here yet. Try another query, or choose a search engine to explore the web.' : 'A little room for good finds. Save a link, or pick another collection.'));
-      byId('result-status').textContent = `${shown} bookmark${shown === 1 ? '' : 's'}${cursor ? ' loaded - more available' : ''}`;
+      byId('result-status').textContent = `${shown} Karakeep bookmark${shown === 1 ? '' : 's'}${cursor ? ' loaded - more available' : ''}`;
     } catch (error) {
       if (requestGeneration !== generation || !user) return;
-      byId('result-status').textContent = 'Could not load bookmarks. Use Refresh to try again.';
+      byId('result-status').textContent = 'Karakeep unavailable. Use Refresh to try again.';
       throw error;
     } finally {
       if (requestGeneration === generation) {
         grid.setAttribute('aria-busy', 'false');
         byId('load-more').hidden = !cursor;
+      }
+    }
+  }
+
+  async function loadHisterSearch(more = false) {
+    const section = byId('hister-results');
+    const grid = byId('hister-grid');
+    const status = byId('hister-status');
+    const query = current.params.q;
+    if (!more) { grid.replaceChildren(); histerLatest = []; histerShown = 0; histerCursor = null; }
+    section.hidden = !query;
+    byId('search-results').classList.toggle('has-query', Boolean(query));
+    byId('load-hister-more').hidden = true;
+    grid.setAttribute('aria-busy', 'false');
+    if (!query) return;
+    byId('hister-heading').textContent = `Hister results for "${query}"`;
+    if (!config.hister || !user?.histerConnected) {
+      status.textContent = config.hister ? 'Hister not connected. Add your token in Customize > Connected accounts.' : 'Hister not configured. Set HISTER_URL on the server to enable search.';
+      return;
+    }
+    const owner = user;
+    const requestGeneration = generation;
+    const params = new URLSearchParams({ q: query });
+    if (more && histerCursor) params.set('cursor', histerCursor);
+    grid.setAttribute('aria-busy', 'true');
+    status.textContent = 'Searching Hister...';
+    try {
+      const data = await api(`hister/search?${params}`);
+      if (owner !== user || requestGeneration !== generation) return;
+      const previousCursor = histerCursor;
+      histerCursor = data.nextCursor && data.nextCursor !== previousCursor ? data.nextCursor : null;
+      histerLatest = more ? [...histerLatest, ...data.documents] : data.documents;
+      histerShown += data.documents.length;
+      for (const document of data.documents) grid.append(histerCard(document));
+      status.textContent = histerShown ? `${histerShown} Hister indexed page${histerShown === 1 ? '' : 's'}${histerCursor ? ' loaded - more available' : ''}` : 'No matching pages in Hister. Indexing is handled by Hister, not Save to Karakeep.';
+    } catch (error) {
+      if (owner !== user || requestGeneration !== generation) return;
+      status.textContent = `Hister search failed: ${error.message} Use Refresh to retry.`;
+      throw error;
+    } finally {
+      if (owner === user && requestGeneration === generation) {
+        grid.setAttribute('aria-busy', 'false');
+        byId('load-hister-more').hidden = !histerCursor;
       }
     }
   }
@@ -233,12 +310,11 @@ function start() {
     if (data.nextCursor) bar.append(button('See all pinned', 'quiet-button', () => selectCollection('Pinned bookmarks', { favourited: 'true' })));
   }
 
-  // Pages you navigated to, from Hister. Absent token or server: the section stays hidden.
   async function loadHistory() {
     const section = byId('history-section');
-    if (!config.hister || !user.hister) { section.hidden = true; return; }
+    if (!config.hister || !user?.histerConnected) { section.hidden = true; return; }
     const owner = user;
-    const data = await api('history?opened=true');
+    const data = await api('history');
     if (!user || owner !== user) return;
     const list = byId('history-list');
     list.replaceChildren();
@@ -255,7 +331,7 @@ function start() {
       list.append(link);
       if (seen.size >= 24) break;
     }
-    if (!list.children.length) list.append(node('p', 'small-note', 'No visited pages yet. Install the Hister browser extension to index what you read.'));
+    if (!list.children.length) list.append(node('p', 'small-note', 'No indexed pages yet. Connect your browser extension or crawler to Hister; saving here only adds Karakeep bookmarks.'));
     section.hidden = false;
   }
 
@@ -307,7 +383,18 @@ function start() {
       renderEditableTags();
       byId('tags-dialog').showModal();
     }));
-    card.append(top, heading, node('p', 'card-description', info.description), bottom);
+    card.append(node('span', 'source-badge source-karakeep', 'Karakeep / bookmark'), top, heading, node('p', 'card-description', info.description), bottom);
+    return card;
+  }
+
+  function histerCard(document) {
+    const info = histerInfo(document);
+    const card = node('article', 'bookmark-card');
+    const heading = node('h3');
+    const title = node(info.url ? 'a' : 'span', '', info.title);
+    if (info.url) title.href = info.url;
+    heading.append(title);
+    card.append(node('span', 'source-badge source-hister', 'Hister / indexed page'), node('p', 'card-domain', info.domain), heading, node('p', 'card-description', info.description));
     return card;
   }
 
@@ -376,18 +463,24 @@ function start() {
       hideSuggestions();
       window.location.assign(engineUrl(engine.template, query));
     }));
-    for (const bookmark of latest.slice(0, 6)) {
-      const info = bookmarkInfo(bookmark);
-      if (!info.url) continue;
-      box.append(suggestion(info.title, info.domain, async () => window.location.assign(info.url)));
+    for (const [source, results, describe] of [['Karakeep', latest, bookmarkInfo], ['Hister', histerLatest, histerInfo]]) {
+      for (const result of results.slice(0, 3)) {
+        const info = describe(result);
+        if (!info.url) continue;
+        box.append(suggestion(info.title, `${source} / ${info.domain}`, async () => window.location.assign(info.url)));
+      }
     }
     box.hidden = false;
   }
 
   async function liveSearch(query) {
     current = { title: query ? `Results for "${query}"` : 'All bookmarks', params: query ? { q: query } : {} };
-    await loadBookmarks();
-    renderSuggestions(query);
+    const owner = user;
+    const results = loadBookmarks();
+    const requestGeneration = generation;
+    try { await results; } finally {
+      if (user === owner && requestGeneration === generation && byId('search-input').value.trim() === query) renderSuggestions(query);
+    }
   }
 
   function renderEditableTags() {
@@ -455,6 +548,8 @@ function start() {
     byId('setting-api-key').value = '';
     byId('setting-hister').value = '';
     user = profile;
+    applyPreferences();
+    byId('connection-label').textContent = user.histerConnected ? 'Karakeep + Hister connected.' : 'Karakeep connected.';
     notice('Keys updated.');
     await refresh();
   }, byId('key-error')));
@@ -467,6 +562,10 @@ function start() {
   });
   byId('search-input').addEventListener('input', () => {
     const query = byId('search-input').value.trim();
+    generation++;
+    latest = [];
+    histerLatest = [];
+    hideSuggestions();
     clearTimeout(liveTimer);
     liveTimer = setTimeout(() => liveSearch(query).catch(error => notice(error.message)), 220);
   });
@@ -505,6 +604,7 @@ function start() {
   byId('all-bookmarks').addEventListener('click', event => action(event.currentTarget, () => selectCollection('All bookmarks', {})));
   byId('pinned-bookmarks').addEventListener('click', event => action(event.currentTarget, () => selectCollection('Pinned bookmarks', { favourited: 'true' })));
   byId('load-more').addEventListener('click', event => action(event.currentTarget, () => loadBookmarks(true)));
+  byId('load-hister-more').addEventListener('click', event => action(event.currentTarget, () => loadHisterSearch(true)));
   byId('more-tags').addEventListener('click', event => action(event.currentTarget, () => loadTags(true)));
   byId('refresh').addEventListener('click', event => action(event.currentTarget, async () => { notice(); await refresh(); }));
 

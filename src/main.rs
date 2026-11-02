@@ -615,6 +615,7 @@ impl App {
                 Some(token)
             }
         };
+        user["histerConnected"] = json!(self.hister.is_some() && hister.is_some());
         Ok((key, hister, user))
     }
 
@@ -796,10 +797,98 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Respons
 }
 
 async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let key = app.key(&headers)?;
-    app.request(&key, Method::GET, "users/me", &[], None)
+    let account = app.account(&headers)?;
+    let mut user = app
+        .request(&account.key, Method::GET, "users/me", &[], None)
+        .await?;
+    user["histerConnected"] = json!(app.hister.is_some() && account.hister.is_some());
+    Ok(Json(user))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HisterSearch {
+    q: String,
+    cursor: Option<String>,
+}
+
+async fn search_hister(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(search): Query<HisterSearch>,
+) -> ApiResult<Json<Value>> {
+    let token = app.hister_key(&headers)?;
+    if search.q.trim().is_empty() || search.q.len() > 2048 {
+        return Err(invalid("Search query must be 1-2048 bytes"));
+    }
+    if search
+        .cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.len() > 4096)
+    {
+        return Err(invalid("Cursor too long"));
+    }
+    let base = app
+        .hister
+        .as_ref()
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "Hister is not configured"))?;
+    let query = json!({
+        "text": search.q,
+        "page_key": search.cursor.unwrap_or_default(),
+        "limit": 40,
+        "include_html": false,
+    });
+    let data = app
+        .call(
+            base,
+            &token,
+            Method::GET,
+            "search",
+            &[
+                ("format".into(), "json".into()),
+                ("query".into(), query.to_string()),
+            ],
+            None,
+        )
         .await
-        .map(Json)
+        .map_err(|error| {
+            if matches!(error.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "Hister rejected its token. Reconnect in Customize > Connected accounts.",
+                )
+            } else {
+                error
+            }
+        })?;
+    if data
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| !error.is_empty())
+    {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "Hister could not complete this search",
+        ));
+    }
+    let documents = match data.get("documents") {
+        Some(Value::Array(documents)) => documents.as_slice(),
+        Some(Value::Null) => &[],
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "Invalid search response from Hister",
+            ));
+        }
+    };
+    let documents: Vec<Value> = documents.iter().map(|document| json!({
+        "url": document.get("url").and_then(Value::as_str).unwrap_or_default(),
+        "title": document.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "text": document.get("text").and_then(Value::as_str).unwrap_or_default().chars().take(500).collect::<String>(),
+    })).collect();
+    Ok(Json(
+        json!({ "documents": documents, "nextCursor": data.get("page_key").and_then(Value::as_str).filter(|cursor| !cursor.is_empty()) }),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -869,6 +958,16 @@ async fn bookmarks(
     let (path, query) = bookmark_query(browse)?;
     app.request(&key, Method::GET, &path, &query, None)
         .await
+        .map_err(|error| {
+            if matches!(error.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "Karakeep rejected its key or search permissions. Reconnect in Customize > Connected accounts.",
+                )
+            } else {
+                error
+            }
+        })
         .map(Json)
 }
 
@@ -1132,6 +1231,7 @@ fn router(app: App) -> Router {
         .route("/api/tags", get(tags))
         .route("/api/lists", get(lists))
         .route("/api/history", get(history))
+        .route("/api/hister/search", get(search_hister))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn(security))
         .with_state(app)

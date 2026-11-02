@@ -3,6 +3,183 @@ use axum::body::{Body, to_bytes};
 use std::collections::HashMap;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn hister_search_uses_account_token_and_preserves_query_and_cursor() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let captured = observed.clone();
+    let mock = Router::new()
+        .route("/api/v1/users/me", get(|| async { Json(json!({"id": "reader"})) }))
+        .route("/api/v1/bookmarks/search", get(|| async { StatusCode::UNAUTHORIZED }))
+        .route("/hister/search", get(move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+            let captured = captured.clone();
+            async move {
+                assert_eq!(params["format"], "json");
+                let query: Value = serde_json::from_str(&params["query"]).unwrap();
+                captured.lock().unwrap().push(query.clone());
+                match query["text"].as_str().unwrap() {
+                    "denied" => return StatusCode::UNAUTHORIZED.into_response(),
+                    "down" => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    "malformed" => return Json(json!({"wrong": []})).into_response(),
+                    "error" => return Json(json!({"error":"internal upstream detail", "documents":[]})).into_response(),
+                    "empty" => return Json(json!({"documents":null,"page_key":""})).into_response(),
+                    _ => (),
+                }
+                Json(json!({
+                    "documents": [{"url":"https://example.com/history", "title":headers[header::AUTHORIZATION].to_str().unwrap(), "text":"<script>untrusted</script>", "html":"must not forward", "metadata":{"private":true}}],
+                    "page_key":"next/+&=?",
+                })).into_response()
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut state = app(&format!("http://{address}/api/v1/"));
+    state.hister = Some(Url::parse(&format!("http://{address}/hister/")).unwrap());
+    for name in ["alice", "bob"] {
+        let account = Account::new(
+            name.into(),
+            "fixture-password",
+            "karakeep-fixture".into(),
+            Some(format!("hister-{name}")),
+        )
+        .unwrap();
+        let mut vault = state.vault.lock().unwrap();
+        vault.accounts.push(account);
+        vault.sessions.push((name.into(), name.into(), now() + 600));
+    }
+    let query_text = "rust & web/#? + 日本語";
+    let cursor = "cursor/+&=?";
+    let mut url = Url::parse("http://local/api/hister/search").unwrap();
+    url.query_pairs_mut()
+        .append_pair("q", query_text)
+        .append_pair("cursor", cursor);
+    let path = format!("{}?{}", url.path(), url.query().unwrap());
+    let denied = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/api/bookmarks?q=rust",
+            "karasearch_session=alice",
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        StatusCode::BAD_GATEWAY,
+        "upstream auth failure is not dashboard logout"
+    );
+    for name in ["alice", "bob"] {
+        let cookie = format!("karasearch_session={name}");
+        let response = router(state.clone())
+            .oneshot(request("GET", &path, &cookie, Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = json_body(response).await;
+        assert_eq!(
+            data["documents"][0]["title"],
+            format!("Bearer hister-{name}")
+        );
+        assert_eq!(data["nextCursor"], "next/+&=?");
+        assert!(data["documents"][0].get("html").is_none());
+        assert!(data["documents"][0].get("metadata").is_none());
+        let response = router(state.clone())
+            .oneshot(request("GET", "/api/me", &cookie, Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["histerConnected"], true);
+    }
+    assert_eq!(
+        observed.lock().unwrap()[0],
+        json!({"text":query_text,"page_key":cursor,"limit":40,"include_html":false})
+    );
+    for path in [
+        "/api/hister/search?q=",
+        "/api/hister/search?q=%20",
+        "/api/hister/search?q=x&extra=bad",
+    ] {
+        let response = router(state.clone())
+            .oneshot(request(
+                "GET",
+                path,
+                "karasearch_session=alice",
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for path in [
+        format!("/api/hister/search?q={}", "x".repeat(2049)),
+        format!("/api/hister/search?q=x&cursor={}", "x".repeat(4097)),
+    ] {
+        let response = router(state.clone())
+            .oneshot(request(
+                "GET",
+                &path,
+                "karasearch_session=alice",
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        2,
+        "invalid requests must not reach upstream"
+    );
+    for query in ["denied", "down", "malformed", "error"] {
+        let response = router(state.clone())
+            .oneshot(request(
+                "GET",
+                &format!("/api/hister/search?q={query}"),
+                "karasearch_session=alice",
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+    let response = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/api/hister/search?q=empty",
+            "karasearch_session=alice",
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(response).await,
+        json!({"documents":[],"nextCursor":null})
+    );
+    let response = router(state.clone())
+        .oneshot(request("GET", &path, "", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    state.vault.lock().unwrap().accounts[0].hister = None;
+    let response = router(state.clone())
+        .oneshot(request(
+            "GET",
+            &path,
+            "karasearch_session=alice",
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    state.hister = None;
+    let response = router(state)
+        .oneshot(request("GET", &path, "karasearch_session=bob", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    server.abort();
+}
+
 fn app(upstream: &str) -> App {
     App {
         client: Client::builder()
@@ -530,7 +707,7 @@ async fn login_proxy_tagging_pinning_and_logout_match_karakeep_contract() {
     assert!(!cookie.contains("test-key") && !cookie.contains("a-long-test-password"));
     assert_eq!(
         json_body(response).await,
-        json!({"id":"user-1","name":"Test reader"})
+        json!({"id":"user-1","name":"Test reader","histerConnected":false})
     );
     let cookie = cookie.split(';').next().unwrap();
     let response = router

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { safeUrl, parseEngines, engineUrl, THEMES } from '../static/app.js';
+import { safeUrl, parseEngines, engineUrl, histerInfo, THEMES } from '../static/app.js';
 
 assert.equal(safeUrl('javascript:alert(1)'), null);
 assert.equal(safeUrl('https://user:pass@example.com'), null);
@@ -13,4 +13,8 @@ for (const text of ['', 'Engine | javascript:{query}', 'Engine | https://example
 }
 assert.throws(() => engineUrl('javascript:{query}', 'test'));
 assert.ok(THEMES.includes('mocha') && THEMES.includes('dracula') && !THEMES.includes('../evil'));
+assert.equal(histerInfo({ url: 'javascript:alert(1)' }).url, null);
+assert.equal(histerInfo({ url: 'file:///private/document' }).url, null);
+assert.equal(histerInfo({ url: 'https://www.example.com/page' }).title, 'example.com');
+assert.equal(histerInfo({ title: '<script>plain text</script>', text: '<b>snippet</b>' }).description, '<b>snippet</b>');
 console.log('Frontend URL, engine and theme checks passed.');
