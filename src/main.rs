@@ -1146,6 +1146,8 @@ async fn config(State(app): State<App>) -> ApiResult<Json<Value>> {
         .is_empty();
     Ok(Json(json!({
         "searchUrl": app.search_url,
+        "karakeepUrl": app.upstream.join("../../").ok().map(|url| url.to_string()),
+        "histerUrl": app.hister.as_ref().map(Url::as_str),
         "hister": app.hister.is_some(),
         // The form offers registration only when it would actually be accepted.
         "canRegister": !claimed || app.open_registration,
@@ -1209,6 +1211,15 @@ fn router(app: App) -> Router {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../static/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/theme.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../static/theme.js"),
                 )
             }),
         )

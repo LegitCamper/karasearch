@@ -4,6 +4,47 @@ use std::collections::HashMap;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn theme_script_is_public_and_service_links_preserve_base_paths() {
+    let mut state = app("https://bookmarks.example.test/keeps/api/v1/");
+    state.hister = Some(Url::parse("https://history.example.test/hister/").unwrap());
+    let routes = router(state);
+    let response = routes
+        .clone()
+        .oneshot(request("GET", "/theme.js", "", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/javascript; charset=utf-8"
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        include_str!("../static/theme.js")
+    );
+    let response = routes
+        .oneshot(request("GET", "/api/config", "", Value::Null))
+        .await
+        .unwrap();
+    let settings = json_body(response).await;
+    assert_eq!(
+        settings["karakeepUrl"],
+        "https://bookmarks.example.test/keeps/"
+    );
+    assert_eq!(
+        settings["histerUrl"],
+        "https://history.example.test/hister/"
+    );
+    let response = router(app("https://bookmarks.example.test/api/v1/"))
+        .oneshot(request("GET", "/api/config", "", Value::Null))
+        .await
+        .unwrap();
+    let settings = json_body(response).await;
+    assert_eq!(settings["karakeepUrl"], "https://bookmarks.example.test/");
+    assert!(settings["histerUrl"].is_null());
+}
+
+#[tokio::test]
 async fn hister_search_uses_account_token_and_preserves_query_and_cursor() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let captured = observed.clone();

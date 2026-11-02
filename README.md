@@ -6,7 +6,7 @@ A small Rust homepage for a self-hosted Karakeep library. Axum serves the fronte
 - Search your library, browse tags, and load more results.
 - Pin links to a bookmark bar using Karakeep favourites.
 - Browse Karakeep lists as nested folders on the bar (`parentId` nesting, one click to open).
-- Live library search while typing, with a suggestion dropdown (first row is `your query (search)`).
+- Centered live search with source-labeled suggestions; local matches come before the explicit web-search action.
 - Add/remove tags and save new links directly to Karakeep.
 - Customize the heading, theme (Paper, After hours, Catppuccin Latte/Frappe/Macchiato/Mocha, Dracula), compact layout, and search engines.
 - Show recently indexed pages from [Hister](https://github.com/asciimoo/hister) on the front page, beside your bookmark bar.
@@ -109,6 +109,12 @@ The default port mapping is loopback-only. For LAN access, deliberately change t
 
 Choose **Karakeep + Hister** to search both connected services, or an engine for browser navigation. Without a Hister connection, this option reads **Karakeep bookmarks**. Each service receives the query unchanged, so service-specific query syntax may produce different results. Results have separate source labels, counts, pagination, and error states; one service failing does not discard the other's results. Selecting a tag or folder still browses only Karakeep. `/` focuses search when not editing another field.
 
+**Browse Karakeep bookmarks** expands pinned and tag filters. While searching, homepage shortcuts collapse, results use compact rows, and source links jump directly to Karakeep or Hister (including on mobile). Clear the query to restore the homepage.
+
+**Open Karakeep** and **Open Hister** open the source apps in new tabs, without putting API keys in their URLs. Their own web sign-in may still be required. Links initially use the configured service base URLs; if those are internal Docker addresses, set browser-reachable URLs in **Customize > Service quick links**. Leave a URL blank to hide its button.
+
+Appearance applies before the first page paint, using this browser's last selected theme. Without a saved theme, the system light/dark preference is used. Account-specific preferences still apply after sign-in; signing out keeps the current appearance instead of flashing the default theme. Only the theme name is cached for early loading, not an account or API key.
+
 Customize accepts one engine per line:
 
 ```text
@@ -130,7 +136,7 @@ Queries are URL-encoded before substitution. Search engines are not proxied. Boo
 - Mutations require a custom same-origin header; no cross-origin API access is enabled. Upstream redirects are disabled to prevent forwarding credentials to another host. The upstream host is operator-configured, never supplied by the login form.
 - Preferences live in browser local storage, keyed by Karakeep user ID. They do not sync between devices. Favourites and tags do sync because Karakeep owns them. Pinning changes your Karakeep favourites, not a separate list.
 - Folders are read-only here: lists are created, renamed, and filled in Karakeep. Each folder loads its first 40 bookmarks on first open and caches them until refresh; smart lists work because Karakeep resolves the query.
-- Live search queries Karakeep and connected Hister, debounced 220 ms. The selected web engine is contacted only when you submit or pick the `(search)` suggestion row.
+- Live search queries Karakeep and connected Hister, debounced 220 ms. The selected web engine is contacted only when you submit or pick the `Search web for` suggestion row.
 - The bar shows links among the first 40 favourites. **Pinned** provides paginated access to all favourites. Bookmark pages contain 40 records; tags load 100 at a time.
 - Notes/assets can appear in library results, but have no external link. This app is not a content reader or attachment viewer.
 - Static assets are embedded into the binary; restart `cargo run` after frontend edits.

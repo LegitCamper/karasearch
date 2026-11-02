@@ -73,6 +73,9 @@ function start() {
     for (const id of ['bookmark-grid', 'bookmark-bar', 'folder-bar', 'tag-list', 'editable-tags', 'history-list', 'hister-grid']) byId(id).replaceChildren();
     byId('history-section').hidden = true;
     byId('hister-results').hidden = true;
+    byId('home-view').classList.remove('has-query');
+    byId('search-summary').hidden = true;
+    byId('library-nav').open = false;
     latest = [];
     histerLatest = [];
     histerShown = 0;
@@ -81,7 +84,6 @@ function start() {
     current = { title: 'All bookmarks', params: {} };
     allTags = [];
     editedBookmark = null;
-    document.documentElement.removeAttribute('data-theme');
     byId('connection-label').textContent = 'Ready for your Karakeep.';
     byId('login-form').reset();
   }
@@ -131,7 +133,15 @@ function start() {
 
   function applyPreferences() {
     document.documentElement.dataset.theme = preferences.theme;
+    try { localStorage.setItem('karasearch:theme', preferences.theme); } catch {}
     document.documentElement.dataset.density = preferences.density;
+    for (const service of ['karakeep', 'hister']) {
+      const link = byId(`open-${service}`);
+      const url = safeUrl(preferences[`${service}Url`]);
+      link.hidden = !url || (service === 'hister' && !config.hister);
+      if (url) link.href = url;
+      else link.removeAttribute('href');
+    }
     byId('greeting').textContent = preferences.greeting;
     const select = byId('search-engine');
     const previous = select.value;
@@ -159,7 +169,10 @@ function start() {
       const saved = JSON.parse(localStorage.getItem(preferenceKey()));
       if (saved) {
         const engines = parseEngines(saved.engines.map(engine => `${engine.name} | ${engine.template}`).join('\n'));
-        preferences = { greeting: typeof saved.greeting === 'string' && saved.greeting.trim() ? saved.greeting.slice(0, 100) : defaults.greeting, theme: THEMES.includes(saved.theme) ? saved.theme : defaults.theme, density: saved.density === 'compact' ? 'compact' : 'comfortable', engines };
+        preferences = { greeting: typeof saved.greeting === 'string' && saved.greeting.trim() ? saved.greeting.slice(0, 100) : defaults.greeting, theme: THEMES.includes(saved.theme) ? saved.theme : defaults.theme, density: saved.density === 'compact' ? 'compact' : 'comfortable', engines,
+          karakeepUrl: saved.karakeepUrl === undefined ? defaults.karakeepUrl : safeUrl(saved.karakeepUrl) || '',
+          histerUrl: saved.histerUrl === undefined ? defaults.histerUrl : safeUrl(saved.histerUrl) || '',
+        };
       }
     } catch { notice('Saved preferences could not be read. Defaults restored for this visit.'); }
     applyPreferences();
@@ -222,7 +235,7 @@ function start() {
     grid.setAttribute('aria-busy', 'true');
     byId('load-more').hidden = true;
     if (!more) { grid.replaceChildren(); shown = 0; cursor = null; latest = []; }
-    byId('library-heading').textContent = current.title;
+    byId('library-heading').textContent = current.params.q ? 'Karakeep bookmarks' : current.title;
     byId('result-status').textContent = 'Searching Karakeep...';
     byId('all-bookmarks').classList.toggle('active', !Object.keys(current.params).length);
     byId('pinned-bookmarks').classList.toggle('active', current.params.favourited === 'true');
@@ -256,10 +269,13 @@ function start() {
     if (!more) { grid.replaceChildren(); histerLatest = []; histerShown = 0; histerCursor = null; }
     section.hidden = !query;
     byId('search-results').classList.toggle('has-query', Boolean(query));
+    byId('home-view').classList.toggle('has-query', Boolean(query));
+    byId('search-summary').hidden = !query;
+    byId('query-heading').textContent = query ? `Results for "${query}"` : '';
     byId('load-hister-more').hidden = true;
     grid.setAttribute('aria-busy', 'false');
     if (!query) return;
-    byId('hister-heading').textContent = `Hister results for "${query}"`;
+    byId('hister-heading').textContent = 'Hister pages';
     if (!config.hister || !user?.histerConnected) {
       status.textContent = config.hister ? 'Hister not connected. Add your token in Customize > Connected accounts.' : 'Hister not configured. Set HISTER_URL on the server to enable search.';
       return;
@@ -383,7 +399,7 @@ function start() {
       renderEditableTags();
       byId('tags-dialog').showModal();
     }));
-    card.append(node('span', 'source-badge source-karakeep', 'Karakeep / bookmark'), top, heading, node('p', 'card-description', info.description), bottom);
+    card.append(top, heading, node('p', 'card-description', info.description), bottom);
     return card;
   }
 
@@ -447,7 +463,6 @@ function start() {
 
   function suggestion(text, label, handler) {
     const row = button('', '', handler);
-    row.setAttribute('role', 'option');
     row.append(node('span', 'suggest-text', text), node('span', 'suggest-tag', label));
     return row;
   }
@@ -456,13 +471,6 @@ function start() {
     const box = byId('suggestions');
     box.replaceChildren();
     if (!query || !user) return hideSuggestions();
-    // ponytail: library results already appear live while typing, so the first row always
-    // means "take this to the web" - the selected engine, or the first one when browsing bookmarks.
-    const engine = webEngine();
-    box.append(suggestion(`${query} (search)`, engine.name, async () => {
-      hideSuggestions();
-      window.location.assign(engineUrl(engine.template, query));
-    }));
     for (const [source, results, describe] of [['Karakeep', latest, bookmarkInfo], ['Hister', histerLatest, histerInfo]]) {
       for (const result of results.slice(0, 3)) {
         const info = describe(result);
@@ -470,6 +478,11 @@ function start() {
         box.append(suggestion(info.title, `${source} / ${info.domain}`, async () => window.location.assign(info.url)));
       }
     }
+    const engine = webEngine();
+    box.append(suggestion(`Search web for "${query}"`, engine.name, async () => {
+      hideSuggestions();
+      window.location.assign(engineUrl(engine.template, query));
+    }));
     box.hidden = false;
   }
 
@@ -575,7 +588,10 @@ function start() {
       if (byId('suggestions').hidden) renderSuggestions(query);
       const first = byId('suggestions').querySelector('button');
       if (first) { event.preventDefault(); first.focus(); }
-    } else if (event.key === 'Escape') hideSuggestions();
+    } else if (event.key === 'Escape' && !byId('suggestions').hidden) {
+      event.preventDefault();
+      hideSuggestions();
+    }
   });
   byId('suggestions').addEventListener('keydown', event => {
     const rows = [...byId('suggestions').querySelectorAll('button')];
@@ -612,6 +628,8 @@ function start() {
     byId('setting-greeting').value = preferences.greeting;
     byId('setting-theme').value = preferences.theme;
     byId('setting-density').value = preferences.density;
+    byId('setting-karakeep-url').value = preferences.karakeepUrl;
+    byId('setting-hister-url').value = preferences.histerUrl;
     byId('setting-engines').value = preferences.engines.map(engine => `${engine.name} | ${engine.template}`).join('\n');
     byId('settings-form').querySelector('.form-error').textContent = '';
     byId('settings-dialog').showModal();
@@ -621,7 +639,10 @@ function start() {
     action(event.submitter, async () => {
       const greeting = byId('setting-greeting').value.trim();
       if (!greeting) throw new Error('Enter a homepage heading.');
-      const updated = { greeting, theme: byId('setting-theme').value, density: byId('setting-density').value, engines: parseEngines(byId('setting-engines').value) };
+      const karakeepUrl = byId('setting-karakeep-url').value.trim();
+      const histerUrl = byId('setting-hister-url').value.trim();
+      if ((karakeepUrl && !safeUrl(karakeepUrl)) || (histerUrl && !safeUrl(histerUrl))) throw new Error('Service links must be HTTP(S) URLs without embedded credentials.');
+      const updated = { greeting, theme: byId('setting-theme').value, density: byId('setting-density').value, engines: parseEngines(byId('setting-engines').value), karakeepUrl, histerUrl };
       localStorage.setItem(preferenceKey(), JSON.stringify(updated));
       preferences = updated;
       applyPreferences();
@@ -680,7 +701,7 @@ function start() {
       // server shows sign-in, because most visitors there already have one.
       loginMode(config.canRegister && !config.openRegistration);
       byId('setting-hister-field').hidden = !config.hister;
-      defaults = { greeting: 'Make room for curiosity.', theme: 'light', density: 'comfortable', engines: parseEngines(`Private Search | ${config.searchUrl}`) };
+      defaults = { greeting: 'Make room for curiosity.', theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light', density: 'comfortable', engines: parseEngines(`Private Search | ${config.searchUrl}`), karakeepUrl: safeUrl(config.karakeepUrl) || '', histerUrl: safeUrl(config.histerUrl) || '' };
       try { await signedIn(await api('me')); } catch (error) {
         showLogin();
         if (error.status !== 401) notice(error.message);
