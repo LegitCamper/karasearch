@@ -5,6 +5,10 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       KARAKEEP_URL: ${KARAKEEP_URL:-http://host.docker.internal:3000}
+      # Optional: unset disables all Hister features.
+      HISTER_URL: ${HISTER_URL:-}
+      # Keep registration open after the first account exists.
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
       SEARCH_URL: ${SEARCH_URL:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       SESSION_STORE: /data/sessions.enc

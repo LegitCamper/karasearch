@@ -35,6 +35,7 @@ if (typeof document !== 'undefined') start();
 function start() {
   const byId = id => document.getElementById(id);
   let user = null;
+  let config = {};
   let defaults;
   let preferences;
   let current = { title: 'All bookmarks', params: {} };
@@ -60,13 +61,15 @@ function start() {
     for (const id of ['home-view', 'library-nav', 'account-actions']) byId(id).hidden = true;
     clearTimeout(liveTimer);
     hideSuggestions();
-    for (const id of ['bookmark-grid', 'bookmark-bar', 'folder-bar', 'tag-list', 'editable-tags']) byId(id).replaceChildren();
+    for (const id of ['bookmark-grid', 'bookmark-bar', 'folder-bar', 'tag-list', 'editable-tags', 'history-list']) byId(id).replaceChildren();
+    byId('history-section').hidden = true;
     byId('search-input').value = '';
     current = { title: 'All bookmarks', params: {} };
     allTags = [];
     editedBookmark = null;
     document.documentElement.removeAttribute('data-theme');
     byId('connection-label').textContent = 'Ready for your Karakeep.';
+    byId('login-form').reset();
   }
 
   async function api(path, options = {}) {
@@ -150,11 +153,21 @@ function start() {
     byId('account-name').textContent = user.name || user.email || 'My library';
     byId('connection-label').textContent = 'Connected to Karakeep.';
     byId('search-input').focus();
+    const wanted = new URLSearchParams(location.search).get('q');
+    if (wanted && wanted.trim()) return handoff(wanted.trim().slice(0, 2048));
     await refresh();
   }
 
+  // Browser-level search entry (/?q=...): library first, web engine when the library has nothing.
+  async function handoff(query) {
+    byId('search-input').value = query;
+    history.replaceState(null, '', '/');
+    await Promise.all([selectCollection(`Results for "${query}"`, { q: query }), loadPins(), loadTags(), loadLists(), loadHistory()]);
+    if (!shown) window.location.assign(engineUrl(preferences.engines[0].template, query));
+  }
+
   async function refresh() {
-    const results = await Promise.allSettled([loadBookmarks(), loadPins(), loadTags(), loadLists()]);
+    const results = await Promise.allSettled([loadBookmarks(), loadPins(), loadTags(), loadLists(), loadHistory()]);
     const errors = results.filter(result => result.status === 'rejected').map(result => result.reason.message);
     if (errors.length) notice([...new Set(errors)].join(' '));
   }
@@ -218,6 +231,32 @@ function start() {
     }
     if (!bar.children.length) bar.append(node('p', 'small-note', 'Pin a link with the star on its card. Your Karakeep favourites live here.'));
     if (data.nextCursor) bar.append(button('See all pinned', 'quiet-button', () => selectCollection('Pinned bookmarks', { favourited: 'true' })));
+  }
+
+  // Pages you navigated to, from Hister. Absent token or server: the section stays hidden.
+  async function loadHistory() {
+    const section = byId('history-section');
+    if (!config.hister || !user.hister) { section.hidden = true; return; }
+    const owner = user;
+    const data = await api('history?opened=true');
+    if (!user || owner !== user) return;
+    const list = byId('history-list');
+    list.replaceChildren();
+    const seen = new Set();
+    for (const item of data.documents || []) {
+      const url = safeUrl(item.url);
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      const title = item.title || new URL(url).hostname.replace(/^www\./, '');
+      const link = node('a', 'bar-link');
+      link.href = url;
+      link.title = `${title} - ${url}`;
+      link.append(node('span', 'bar-icon', title.charAt(0).toUpperCase()), node('span', 'bar-title', title));
+      list.append(link);
+      if (seen.size >= 24) break;
+    }
+    if (!list.children.length) list.append(node('p', 'small-note', 'No visited pages yet. Install the Hister browser extension to index what you read.'));
+    section.hidden = false;
   }
 
   async function loadTags(more = false) {
@@ -370,16 +409,56 @@ function start() {
     if (!container.children.length) container.append(node('p', 'small-note', 'No tags yet. Give this find a home.'));
   }
 
+  // One form, two modes: an unclaimed server registers, an existing account signs in.
+  function loginMode(registering) {
+    byId('key-fields').hidden = !registering;
+    byId('api-key').required = registering;
+    byId('hister-field').hidden = !(registering && config.hister);
+    byId('login-step').textContent = registering ? '01 / MAKE YOURSELF AT HOME' : '01 / WELCOME BACK';
+    byId('login-heading').textContent = registering ? 'Create your account' : 'Sign in';
+    byId('login-action').textContent = registering ? 'Create account' : 'Sign in';
+    byId('login-blurb').textContent = registering
+      ? 'Pick a username and password, then paste your keys once. Future sign-ins need only the password.'
+      : 'One account, saved in your password manager. It unlocks your saved keys.';
+    byId('password').setAttribute('autocomplete', registering ? 'new-password' : 'current-password');
+    // Offer the other mode only when the server would accept a new account.
+    byId('mode-switch').hidden = !config.canRegister;
+    byId('switch-mode').textContent = registering ? 'Already have an account? Sign in' : 'Need an account? Create one';
+    byId('login-form').querySelector('.form-error').textContent = '';
+  }
+
   byId('login-form').addEventListener('submit', event => {
     event.preventDefault();
-    const key = byId('api-key').value;
+    const form = event.currentTarget;
+    const registering = !byId('key-fields').hidden;
+    const body = { username: byId('username').value, password: byId('password').value };
+    if (registering) {
+      body.api_key = byId('api-key').value;
+      body.hister_token = byId('hister-token').value || null;
+    }
     action(event.submitter, async () => {
       notice();
-      const profile = await api('login', { method: 'POST', body: JSON.stringify({ api_key: key }) });
-      byId('api-key').value = '';
+      const profile = await api(registering ? 'register' : 'login', { method: 'POST', body: JSON.stringify(body) });
+      form.reset();
+      // The server is claimed now, so a later sign-out shows the sign-in form.
+      // A server that only allowed one account is claimed now.
+      if (registering && !config.openRegistration) config.canRegister = false;
       await signedIn(profile);
-    });
+    }, form.querySelector('.form-error'));
   });
+
+  byId('save-keys').addEventListener('click', event => action(event.currentTarget, async () => {
+    const profile = await api('keys', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: byId('setting-api-key').value, hister_token: byId('setting-hister').value || null }),
+    });
+    byId('setting-api-key').value = '';
+    byId('setting-hister').value = '';
+    user = profile;
+    notice('Keys updated.');
+    await refresh();
+  }, byId('key-error')));
+  byId('switch-mode').addEventListener('click', () => loginMode(byId('key-fields').hidden));
   byId('logout').addEventListener('click', event => action(event.currentTarget, async () => { await api('logout', { method: 'POST' }); showLogin(); notice('Signed out.'); }));
   byId('search-engine').addEventListener('change', () => {
     updateHint();
@@ -496,7 +575,11 @@ function start() {
 
   async function boot() {
     try {
-      const config = await api('config');
+      config = await api('config');
+      // Default to registering only on a server with no accounts yet; an open
+      // server shows sign-in, because most visitors there already have one.
+      loginMode(config.canRegister && !config.openRegistration);
+      byId('setting-hister-field').hidden = !config.hister;
       defaults = { greeting: 'Make room for curiosity.', theme: 'light', density: 'comfortable', engines: parseEngines(`Private Search | ${config.searchUrl}`) };
       try { await signedIn(await api('me')); } catch (error) {
         showLogin();

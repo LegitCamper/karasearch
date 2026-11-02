@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     env, fs,
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
@@ -19,15 +18,109 @@ use axum::{
 use reqwest::{Client, Url};
 use ring::{
     aead::{self, Nonce, UnboundKey},
-    hkdf,
+    hkdf, pbkdf2,
     rand::{SecureRandom, SystemRandom},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SESSION_SECONDS: u64 = 43_200;
 const NONCE_LEN: usize = 12;
+const MAX_ACCOUNTS: usize = 256;
+/// OWASP's 2023 floor for PBKDF2-HMAC-SHA256. ring has no Argon2, and this
+/// costs ~0.2s per sign-in, which is acceptable for a personal start page.
+const PBKDF2_ROUNDS: u32 = 600_000;
+
+/// ponytail: PBKDF2 because `ring` already ships it; move to Argon2id (new
+/// dependency) if this ever faces untrusted internet traffic.
+#[derive(Clone, Serialize, Deserialize)]
+struct Account {
+    username: String,
+    /// Hex, 16 bytes, unique per account.
+    salt: String,
+    /// Hex, 32 bytes, PBKDF2-HMAC-SHA256 over the password.
+    hash: String,
+    /// Karakeep API key, encrypted at rest with the rest of this file.
+    key: String,
+    hister: Option<String>,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..value.len() / 2)
+        .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok())
+        .collect()
+}
+
+impl Account {
+    fn new(
+        username: String,
+        password: &str,
+        key: String,
+        hister: Option<String>,
+    ) -> Result<Self, String> {
+        let mut salt = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut salt)
+            .map_err(|_| "Could not generate a password salt".to_owned())?;
+        let mut hash = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            PBKDF2_ROUNDS.try_into().expect("non-zero rounds"),
+            &salt,
+            password.as_bytes(),
+            &mut hash,
+        );
+        Ok(Self {
+            username,
+            salt: hex(&salt),
+            hash: hex(&hash),
+            key,
+            hister,
+        })
+    }
+
+    /// Constant-time comparison; a mismatched or corrupt record fails closed.
+    fn verify(&self, password: &str) -> bool {
+        let (Some(salt), Some(expected)) = (unhex(&self.salt), unhex(&self.hash)) else {
+            return false;
+        };
+        if expected.len() != 32 {
+            return false;
+        }
+        let mut hash = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            PBKDF2_ROUNDS.try_into().expect("non-zero rounds"),
+            &salt,
+            password.as_bytes(),
+            &mut hash,
+        );
+        // Fold every byte before comparing, so timing does not reveal the
+        // position of the first mismatch.
+        hash.iter()
+            .zip(&expected)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+    }
+}
+
+/// Everything persisted in the encrypted store file.
+#[derive(Default, Serialize, Deserialize)]
+struct Vault {
+    #[serde(default)]
+    accounts: Vec<Account>,
+    /// (token, username, expires)
+    #[serde(default)]
+    sessions: Vec<(String, String, u64)>,
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -47,7 +140,7 @@ impl Store {
             return Err("SESSION_SECRET must be at least 32 characters".into());
         }
         let mut key = [0u8; 32];
-        hkdf::Salt::new(hkdf::HKDF_SHA256, b"karasearch session store v1")
+        hkdf::Salt::new(hkdf::HKDF_SHA256, b"karasearch session store v3")
             .extract(secret.as_bytes())
             .expand(&[b"sessions"], hkdf::HKDF_SHA256)
             .and_then(|okm| okm.fill(&mut key))
@@ -61,10 +154,12 @@ impl Store {
             .map_err(|_| "Invalid session encryption key".to_owned())
     }
 
-    fn load(&self) -> Result<HashMap<String, Session>, String> {
+    fn load(&self) -> Result<Vault, String> {
         let file = match fs::File::open(&self.path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vault::default());
+            }
             Err(error) => return Err(format!("Could not read {}: {error}", self.path.display())),
         };
         let mut sealed = Vec::new();
@@ -90,24 +185,26 @@ impl Store {
             .map_err(|_| {
                 "Could not decrypt the session store; SESSION_SECRET likely changed".to_owned()
             })?;
-        let records: Vec<(String, String, u64)> =
+        let mut vault: Vault =
             serde_json::from_slice(plain).map_err(|_| "Session store is corrupt".to_owned())?;
-        if records.len() > 1024 {
+        if vault.sessions.len() > 1024 {
             return Err("Session store exceeds session capacity".into());
         }
-        Ok(records
-            .into_iter()
-            .filter(|(_, _, expires)| *expires > now())
-            .map(|(token, key, expires)| (token, Session { key, expires }))
-            .collect())
+        if vault.accounts.len() > MAX_ACCOUNTS {
+            return Err("Session store exceeds account capacity".into());
+        }
+        vault.sessions.retain(|(_, username, expires)| {
+            *expires > now()
+                && vault
+                    .accounts
+                    .iter()
+                    .any(|account| &account.username == username)
+        });
+        Ok(vault)
     }
 
-    fn save(&self, sessions: &HashMap<String, Session>) -> Result<(), String> {
-        let records: Vec<(&String, &String, u64)> = sessions
-            .iter()
-            .map(|(token, session)| (token, &session.key, session.expires))
-            .collect();
-        let mut buffer = serde_json::to_vec(&records).map_err(|_| "Could not encode sessions")?;
+    fn save(&self, vault: &Vault) -> Result<(), String> {
+        let mut buffer = serde_json::to_vec(vault).map_err(|_| "Could not encode sessions")?;
         let mut nonce = [0u8; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -149,17 +246,13 @@ impl Store {
 struct App {
     client: Client,
     upstream: Url,
+    hister: Option<Url>,
     search_url: String,
     secure_cookie: bool,
+    open_registration: bool,
     // ponytail: single-process store; add Redis/Postgres only when running replicas.
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    vault: Arc<Mutex<Vault>>,
     store: Option<Arc<Store>>,
-}
-
-#[derive(Clone)]
-struct Session {
-    key: String,
-    expires: u64,
 }
 
 struct ApiError(StatusCode, &'static str);
@@ -170,6 +263,55 @@ impl IntoResponse for ApiError {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }
+
+/// Both upstreams map statuses the same way; only the service name differs, and
+/// ApiError holds a &'static str, so each service carries its own literals.
+fn upstream_error(hister: bool, status: StatusCode) -> ApiError {
+    let (code, messages) = match status {
+        StatusCode::UNAUTHORIZED => (
+            status,
+            (
+                "Karakeep rejected this API key. Sign in again.",
+                "Hister rejected this access token. Sign in again.",
+            ),
+        ),
+        StatusCode::FORBIDDEN => (
+            status,
+            (
+                "API key lacks permission for this action.",
+                "Access token lacks permission for this action.",
+            ),
+        ),
+        StatusCode::NOT_FOUND => (
+            status,
+            ("Karakeep resource not found.", "Hister resource not found."),
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            status,
+            (
+                "Karakeep rate limit reached. Try again shortly.",
+                "Hister rate limit reached. Try again shortly.",
+            ),
+        ),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => (
+            StatusCode::BAD_REQUEST,
+            (
+                "Karakeep rejected this request. Check your query or input.",
+                "Hister rejected this request. Check your query or input.",
+            ),
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            (
+                "Karakeep could not complete this request.",
+                "Hister could not complete this request.",
+            ),
+        ),
+    };
+    ApiError(code, if hister { messages.1 } else { messages.0 })
+}
+
+const UNAUTHENTICATED: ApiError = ApiError(StatusCode::UNAUTHORIZED, "Sign in to continue.");
 
 fn invalid(message: &'static str) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message)
@@ -187,6 +329,17 @@ fn http_url(value: &str) -> Result<Url, &'static str> {
     Ok(url)
 }
 
+/// Name the variable and the value it rejected: a bare "invalid URL" leaves an
+/// operator guessing which container setting is wrong.
+fn setting(name: &str, value: &str, problem: &str) -> String {
+    let example = match name {
+        "SEARCH_URL" => "http://host:8080/search?q={query}",
+        "HISTER_URL" => "http://host:4433",
+        _ => "http://host:3000",
+    };
+    format!("{name} is set to '{value}', which is not usable. {problem}. Example: {name}={example}")
+}
+
 fn session_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::COOKIE)?
@@ -198,38 +351,69 @@ fn session_id(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl App {
-    fn key(&self, headers: &HeaderMap) -> ApiResult<String> {
-        let mut sessions = self.sessions.lock().map_err(|_| {
+    /// The account behind this request's cookie, with its stored upstream keys.
+    fn account(&self, headers: &HeaderMap) -> ApiResult<Account> {
+        let mut vault = self.vault.lock().map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Session store unavailable",
             )
         })?;
-        sessions.retain(|_, session| session.expires > now());
-        session_id(headers)
-            .and_then(|id| sessions.get(id))
-            .map(|session| session.key.clone())
-            .ok_or(ApiError(
-                StatusCode::UNAUTHORIZED,
-                "Sign in with your Karakeep API key",
-            ))
+        vault.sessions.retain(|(_, _, expires)| *expires > now());
+        let id = session_id(headers).ok_or(UNAUTHENTICATED)?;
+        let username = vault
+            .sessions
+            .iter()
+            .find(|(token, _, _)| token == id)
+            .map(|(_, username, _)| username.clone())
+            .ok_or(UNAUTHENTICATED)?;
+        vault
+            .accounts
+            .iter()
+            .find(|account| account.username == username)
+            .cloned()
+            .ok_or(UNAUTHENTICATED)
     }
 
-    async fn update_sessions(
+    fn key(&self, headers: &HeaderMap) -> ApiResult<String> {
+        self.account(headers).map(|account| account.key)
+    }
+
+    /// The Hister token saved on this account, or a 404/409 naming what is missing.
+    fn hister_key(&self, headers: &HeaderMap) -> ApiResult<String> {
+        if self.hister.is_none() {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                "This server is not configured for Hister. Set HISTER_URL.",
+            ));
+        }
+        self.account(headers)?.hister.ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "This account has no Hister token. Add one in Customize.",
+        ))
+    }
+
+    /// Mutates a copy, persists it, and only then swaps it in, so a failed write
+    /// never leaves memory claiming a change that is not on disk. Password hashing
+    /// runs here too, hence spawn_blocking.
+    async fn update_vault<T: Send + 'static>(
         &self,
-        change: impl FnOnce(&mut HashMap<String, Session>) -> ApiResult<()> + Send + 'static,
-    ) -> ApiResult<()> {
+        change: impl FnOnce(&mut Vault) -> ApiResult<T> + Send + 'static,
+    ) -> ApiResult<T> {
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut sessions = app.sessions.lock().map_err(|_| {
+            let mut vault = app.vault.lock().map_err(|_| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Session store unavailable",
                 )
             })?;
-            let mut updated = sessions.clone();
-            updated.retain(|_, session| session.expires > now());
-            change(&mut updated)?;
+            let mut updated = Vault {
+                accounts: vault.accounts.clone(),
+                sessions: vault.sessions.clone(),
+            };
+            updated.sessions.retain(|(_, _, expires)| *expires > now());
+            let result = change(&mut updated)?;
             if let Some(store) = &app.store {
                 store.save(&updated).map_err(|error| {
                     eprintln!("karasearch: {error}");
@@ -239,8 +423,8 @@ impl App {
                     )
                 })?;
             }
-            *sessions = updated;
-            Ok(())
+            *vault = updated;
+            Ok(result)
         })
         .await
         .map_err(|_| {
@@ -259,10 +443,20 @@ impl App {
         query: &[(String, String)],
         body: Option<Value>,
     ) -> ApiResult<Value> {
-        let url = self
-            .upstream
-            .join(path)
-            .map_err(|_| invalid("Invalid API path"))?;
+        self.call(&self.upstream, key, method, path, query, body)
+            .await
+    }
+
+    async fn call(
+        &self,
+        base: &Url,
+        key: &str,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> ApiResult<Value> {
+        let url = base.join(path).map_err(|_| invalid("Invalid API path"))?;
         let mut request = self
             .client
             .request(method, url)
@@ -271,39 +465,29 @@ impl App {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        let hister = self.hister.as_ref().is_some_and(|url| url == base);
         let response = request.send().await.map_err(|_| {
             ApiError(
                 StatusCode::BAD_GATEWAY,
-                "Cannot reach Karakeep. Check KARAKEEP_URL and container connectivity.",
+                if hister {
+                    "Cannot reach Hister. Check HISTER_URL and container connectivity."
+                } else {
+                    "Cannot reach Karakeep. Check KARAKEEP_URL and container connectivity."
+                },
             )
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(match status {
-                StatusCode::UNAUTHORIZED => {
-                    ApiError(status, "Karakeep rejected this API key. Sign in again.")
-                }
-                StatusCode::FORBIDDEN => {
-                    ApiError(status, "API key lacks permission for this action.")
-                }
-                StatusCode::NOT_FOUND => ApiError(status, "Karakeep resource not found."),
-                StatusCode::TOO_MANY_REQUESTS => {
-                    ApiError(status, "Karakeep rate limit reached. Try again shortly.")
-                }
-                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "Karakeep rejected this request. Check your query or input.",
-                ),
-                _ => ApiError(
-                    StatusCode::BAD_GATEWAY,
-                    "Karakeep could not complete this request.",
-                ),
-            });
+            return Err(upstream_error(hister, status));
         }
         response.json().await.map_err(|_| {
             ApiError(
                 StatusCode::BAD_GATEWAY,
-                "Invalid JSON response from Karakeep",
+                if hister {
+                    "Invalid JSON response from Hister"
+                } else {
+                    "Invalid JSON response from Karakeep"
+                },
             )
         })
     }
@@ -352,62 +536,254 @@ async fn security(request: Request, next: Next) -> Response {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Login {
-    api_key: String,
+struct Credentials {
+    username: String,
+    password: String,
+    /// Required on register, optional on sign-in (ignored there).
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    hister_token: Option<String>,
+}
+
+/// Both upstreams accept opaque bearer tokens; reject anything that could not be
+/// one before it reaches an upstream or the store.
+fn bearer(value: &str, message: &'static str) -> ApiResult<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 4096
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(invalid(message));
+    }
+    Ok(value.to_owned())
+}
+
+fn credentials(username: &str, password: &str) -> ApiResult<(String, String)> {
+    let username = username.trim();
+    if username.is_empty()
+        || username.len() > 64
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c))
+    {
+        return Err(invalid(
+            "Username must be 1-64 characters: letters, digits, and - _ . @",
+        ));
+    }
+    // Length is the only rule that matters here; composition rules push people
+    // toward predictable passwords, and a manager generates these anyway.
+    if password.len() < 12 || password.len() > 256 {
+        return Err(invalid("Password must be 12-256 characters"));
+    }
+    Ok((username.to_owned(), password.to_owned()))
+}
+
+impl App {
+    /// Confirms a key works before it is stored, so a typo fails at the form
+    /// rather than silently breaking the home page later.
+    async fn check_keys(
+        &self,
+        key: &str,
+        hister: Option<&str>,
+    ) -> ApiResult<(String, Option<String>, Value)> {
+        let key = bearer(key, "Enter a valid Karakeep API key")?;
+        let mut user = self
+            .request(&key, Method::GET, "users/me", &[], None)
+            .await?;
+        if user.get("id").and_then(Value::as_str).is_none() {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "Karakeep returned no user ID",
+            ));
+        }
+        let hister = match hister.map(str::trim) {
+            None | Some("") => None,
+            Some(token) => {
+                let token = bearer(token, "Enter a valid Hister access token")?;
+                let base = self.hister.as_ref().ok_or(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "This server is not configured for Hister. Set HISTER_URL.",
+                ))?;
+                let profile = self
+                    .call(base, &token, Method::GET, "api/profile", &[], None)
+                    .await?;
+                if let Some(object) = user.as_object_mut() {
+                    object.insert("hister".into(), profile);
+                }
+                Some(token)
+            }
+        };
+        Ok((key, hister, user))
+    }
+
+    /// Issues the cookie and replaces this browser's previous session.
+    async fn start_session(
+        &self,
+        username: String,
+        headers: &HeaderMap,
+    ) -> ApiResult<(String, String)> {
+        let token = Uuid::new_v4().to_string();
+        let cookie = self.cookie(&token, SESSION_SECONDS);
+        let previous = session_id(headers).map(str::to_owned);
+        let issued = token.clone();
+        self.update_vault(move |vault| {
+            if let Some(previous) = previous {
+                vault
+                    .sessions
+                    .retain(|(existing, _, _)| existing != &previous);
+            }
+            if vault.sessions.len() >= 1024 {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session capacity reached",
+                ));
+            }
+            vault
+                .sessions
+                .push((issued, username, now() + SESSION_SECONDS));
+            Ok(())
+        })
+        .await?;
+        Ok((token, cookie))
+    }
+}
+
+/// First run creates the account; afterwards registration is closed unless
+/// ALLOW_REGISTRATION=true, so an exposed instance cannot be claimed by a stranger.
+async fn register(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Credentials>,
+) -> ApiResult<Response> {
+    let (username, password) = credentials(&body.username, &body.password)?;
+    let key = body
+        .api_key
+        .as_deref()
+        .ok_or(invalid("A Karakeep API key is required"))?;
+    {
+        let vault = app.vault.lock().map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session store unavailable",
+            )
+        })?;
+        if !vault.accounts.is_empty() && !app.open_registration {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "Registration is closed on this server.",
+            ));
+        }
+    }
+    let (key, hister, user) = app.check_keys(key, body.hister_token.as_deref()).await?;
+    let name = username.clone();
+    app.update_vault(move |vault| {
+        if vault
+            .accounts
+            .iter()
+            .any(|account| account.username == name)
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "That username is already taken.",
+            ));
+        }
+        if vault.accounts.len() >= MAX_ACCOUNTS {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account capacity reached",
+            ));
+        }
+        vault
+            .accounts
+            .push(Account::new(name, &password, key, hister).map_err(|error| {
+                eprintln!("karasearch: {error}");
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not create the account; retry",
+                )
+            })?);
+        Ok(())
+    })
+    .await?;
+    let (_, cookie) = app.start_session(username, &headers).await?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::SET_COOKIE, cookie)],
+        Json(user),
+    )
+        .into_response())
 }
 
 async fn login(
     State(app): State<App>,
     headers: HeaderMap,
-    Json(login): Json<Login>,
+    Json(body): Json<Credentials>,
 ) -> ApiResult<Response> {
-    let key = login.api_key.trim();
-    if key.is_empty()
-        || key.len() > 4096
-        || !key.is_ascii()
-        || key.bytes().any(|byte| byte.is_ascii_control())
-    {
-        return Err(invalid("Enter a valid Karakeep API key"));
-    }
-    let user = app.request(key, Method::GET, "users/me", &[], None).await?;
-    if user.get("id").and_then(Value::as_str).is_none() {
-        return Err(ApiError(
-            StatusCode::BAD_GATEWAY,
-            "Karakeep returned no user ID",
-        ));
-    }
-    let token = Uuid::new_v4().to_string();
-    let cookie = app.cookie(&token, SESSION_SECONDS);
-    let previous = session_id(&headers).map(str::to_owned);
-    let key = key.to_owned();
-    app.update_sessions(move |sessions| {
-        if let Some(previous) = previous {
-            sessions.remove(&previous);
-        }
-        if sessions.len() >= 1024 {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Session capacity reached",
-            ));
-        }
-        sessions.insert(
-            token,
-            Session {
-                key,
-                expires: now() + SESSION_SECONDS,
-            },
-        );
+    let username = body.username.trim().to_owned();
+    let password = body.password.clone();
+    // Hashing is deliberately slow, so verify off the async runtime.
+    let account = app
+        .update_vault(move |vault| {
+            vault
+                .accounts
+                .iter()
+                .find(|account| account.username == username && account.verify(&password))
+                .cloned()
+                .ok_or(ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "Incorrect username or password.",
+                ))
+        })
+        .await?;
+    // Surface a revoked upstream key at sign-in instead of as a broken home page.
+    let (_, _, user) = app
+        .check_keys(&account.key, account.hister.as_deref())
+        .await?;
+    let (_, cookie) = app.start_session(account.username, &headers).await?;
+    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Keys {
+    api_key: String,
+    #[serde(default)]
+    hister_token: Option<String>,
+}
+
+/// Replaces the stored upstream keys for the signed-in account. The cookie is the
+/// authorization here, so no password is resent.
+async fn update_keys(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Keys>,
+) -> ApiResult<Json<Value>> {
+    let account = app.account(&headers)?;
+    let (key, hister, user) = app
+        .check_keys(&body.api_key, body.hister_token.as_deref())
+        .await?;
+    let username = account.username.clone();
+    app.update_vault(move |vault| {
+        let account = vault
+            .accounts
+            .iter_mut()
+            .find(|account| account.username == username)
+            .ok_or(UNAUTHENTICATED)?;
+        account.key = key;
+        account.hister = hister;
         Ok(())
     })
     .await?;
-    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
+    Ok(Json(user))
 }
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
     if let Some(token) = session_id(&headers) {
         let token = token.to_owned();
-        app.update_sessions(move |sessions| {
-            sessions.remove(&token);
+        app.update_vault(move |vault| {
+            vault.sessions.retain(|(existing, _, _)| existing != &token);
             Ok(())
         })
         .await?;
@@ -520,6 +896,49 @@ async fn tags(
         .map(Json)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct History {
+    /// true: pages you navigated to. false/absent: pages Hister indexed.
+    opened: Option<bool>,
+    last: Option<String>,
+    last_id: Option<u64>,
+    last_updated_at: Option<String>,
+}
+
+async fn history(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(page): Query<History>,
+) -> ApiResult<Json<Value>> {
+    let token = app.hister_key(&headers)?;
+    let base = app.hister.clone().ok_or(ApiError(
+        StatusCode::NOT_FOUND,
+        "This server is not configured for Hister. Set HISTER_URL.",
+    ))?;
+    let mut query = Vec::new();
+    if page.opened.unwrap_or(false) {
+        query.push(("opened".into(), "true".into()));
+        if let Some(id) = page.last_id {
+            query.push(("last_id".into(), id.to_string()));
+        }
+        if let Some(updated) = page.last_updated_at {
+            if updated.len() > 64 {
+                return Err(invalid("Cursor too long"));
+            }
+            query.push(("last_updated_at".into(), updated));
+        }
+    } else if let Some(last) = page.last {
+        if last.len() > 4096 {
+            return Err(invalid("Cursor too long"));
+        }
+        query.push(("last".into(), last));
+    }
+    app.call(&base, &token, Method::GET, "api/history", &query, None)
+        .await
+        .map(Json)
+}
+
 async fn lists(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let key = app.key(&headers)?;
     app.request(&key, Method::GET, "lists", &[], None)
@@ -612,16 +1031,99 @@ async fn add_bookmark(
     .map(Json)
 }
 
+// Browsers fetch this once to offer Karasearch as a search engine; the Url template must be
+// absolute, so it is built from the request Host.
+async fn config(State(app): State<App>) -> ApiResult<Json<Value>> {
+    let claimed = !app
+        .vault
+        .lock()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session store unavailable",
+            )
+        })?
+        .accounts
+        .is_empty();
+    Ok(Json(json!({
+        "searchUrl": app.search_url,
+        "hister": app.hister.is_some(),
+        // The form offers registration only when it would actually be accepted.
+        "canRegister": !claimed || app.open_registration,
+        // Distinguishes "first run" from "shared server": the first defaults to
+        // the register form, the second to sign-in with a link to register.
+        "openRegistration": app.open_registration,
+    })))
+}
+
+async fn opensearch(State(app): State<App>, headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 255
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
+        })
+        .unwrap_or("localhost");
+    let scheme = if app.secure_cookie { "https" } else { "http" };
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Karasearch</ShortName>
+  <Description>Search your Karakeep library</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  <Url type="text/html" method="get" template="{scheme}://{host}/?q={{searchTerms}}"/>
+</OpenSearchDescription>
+"#
+    );
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/opensearchdescription+xml",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 fn router(app: App) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("../static/index.html")) }))
-        .route("/app.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../static/app.css")) }))
-        .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../static/app.js")) }))
-        .route("/api/config", get(|State(app): State<App>| async move { Json(json!({ "searchUrl": app.search_url })) }))
+        .route(
+            "/",
+            get(|| async { Html(include_str!("../static/index.html")) }),
+        )
+        .route(
+            "/app.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../static/app.css"),
+                )
+            }),
+        )
+        .route(
+            "/app.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../static/app.js"),
+                )
+            }),
+        )
+        .route("/opensearch.xml", get(opensearch))
+        .route("/api/config", get(config))
         // Liveness only: no auth, no session counts, and no upstream call, so a Karakeep
         // outage never restarts a healthy Karasearch.
-        .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({ "status": "ok" })) }),
+        )
+        .route("/api/register", post(register))
         .route("/api/login", post(login))
+        .route("/api/keys", post(update_keys))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/bookmarks", get(bookmarks).post(add_bookmark))
@@ -629,13 +1131,22 @@ fn router(app: App) -> Router {
         .route("/api/bookmarks/{id}/tags", post(edit_tag).delete(edit_tag))
         .route("/api/tags", get(tags))
         .route("/api/lists", get(lists))
+        .route("/api/history", get(history))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn(security))
         .with_state(app)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(error) = run().await {
+        // Display, not Debug: operators read this in `docker logs`.
+        eprintln!("karasearch: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let address = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     // `karasearch healthcheck` keeps the runtime image free of curl/wget.
     if env::args().nth(1).as_deref() == Some("healthcheck") {
@@ -655,31 +1166,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     }
     let upstream = env::var("KARAKEEP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
-    let mut upstream = http_url(&upstream)?;
+    let mut upstream =
+        http_url(&upstream).map_err(|error| setting("KARAKEEP_URL", &upstream, error))?;
     if upstream.query().is_some() || upstream.fragment().is_some() {
-        return Err("KARAKEEP_URL must not contain a query or fragment".into());
+        return Err(setting(
+            "KARAKEEP_URL",
+            upstream.as_str(),
+            "Remove the query or fragment",
+        )
+        .into());
     }
     upstream.set_path(&format!(
         "{}/api/v1/",
         upstream.path().trim_end_matches('/')
     ));
+    // Optional: without HISTER_URL the app behaves exactly as before.
+    let hister = match env::var("HISTER_URL").ok().filter(|v| !v.is_empty()) {
+        Some(value) => {
+            let mut url = http_url(&value).map_err(|error| setting("HISTER_URL", &value, error))?;
+            if url.query().is_some() || url.fragment().is_some() {
+                return Err(
+                    setting("HISTER_URL", url.as_str(), "Remove the query or fragment").into(),
+                );
+            }
+            // Trailing slash keeps Url::join appending rather than replacing the base path.
+            url.set_path(&format!("{}/", url.path().trim_end_matches('/')));
+            Some(url)
+        }
+        None => None,
+    };
     let search_url = env::var("SEARCH_URL")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "http://localhost:8080/search?q={query}&t=general".into());
-    let checked_search = http_url(&search_url.replace("{query}", "karasearchquerymarker"))?;
+    let checked_search = http_url(&search_url.replace("{query}", "karasearchquerymarker"))
+        .map_err(|error| setting("SEARCH_URL", &search_url, error))?;
     if !search_url.contains("{query}")
         || search_url.len() > 2048
         || checked_search
             .host_str()
             .is_some_and(|host| host.contains("karasearchquerymarker"))
     {
-        return Err("SEARCH_URL must be at most 2048 bytes and contain {query} in its path or query, not its hostname".into());
+        return Err(setting(
+            "SEARCH_URL",
+            &search_url,
+            "Use at most 2048 bytes and put {query} in the path or query, not the hostname",
+        )
+        .into());
     }
     let secure_cookie = match env::var("COOKIE_SECURE").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(env::VarError::NotPresent) => false,
         _ => return Err("COOKIE_SECURE must be true or false".into()),
+    };
+    let open_registration = match env::var("ALLOW_REGISTRATION").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(env::VarError::NotPresent) => false,
+        _ => return Err("ALLOW_REGISTRATION must be true or false".into()),
     };
     let store = match env::var("SESSION_STORE").ok().filter(|p| !p.is_empty()) {
         Some(path) => {
@@ -689,16 +1232,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let sessions = match &store {
+    let vault = match &store {
         Some(store) => {
-            let sessions = store.load()?;
-            store.save(&sessions)?;
-            sessions
+            let vault = store.load()?;
+            store.save(&vault)?;
+            vault
         }
-        None => HashMap::new(),
+        None => Vault::default(),
     };
-    if !sessions.is_empty() {
-        println!("Karasearch restored {} session(s)", sessions.len());
+    if !vault.accounts.is_empty() || !vault.sessions.is_empty() {
+        println!(
+            "Karasearch restored {} account(s) and {} session(s)",
+            vault.accounts.len(),
+            vault.sessions.len()
+        );
+    }
+    if store.is_none() {
+        println!(
+            "Karasearch has no SESSION_STORE: accounts live in memory and are lost on restart"
+        );
     }
     let app = App {
         client: Client::builder()
@@ -706,9 +1258,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         upstream,
+        hister,
         search_url,
         secure_cookie,
-        sessions: Arc::new(Mutex::new(sessions)),
+        open_registration,
+        vault: Arc::new(Mutex::new(vault)),
         store,
     };
     let listener = tokio::net::TcpListener::bind(&address).await?;

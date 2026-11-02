@@ -1,5 +1,6 @@
 use super::*;
 use axum::body::{Body, to_bytes};
+use std::collections::HashMap;
 use tower::ServiceExt;
 
 fn app(upstream: &str) -> App {
@@ -9,9 +10,11 @@ fn app(upstream: &str) -> App {
             .build()
             .unwrap(),
         upstream: Url::parse(upstream).unwrap(),
+        hister: None,
         search_url: "http://localhost:8080/search?q={query}".into(),
         secure_cookie: false,
-        sessions: Arc::new(Mutex::new(HashMap::new())),
+        open_registration: true,
+        vault: Arc::new(Mutex::new(Vault::default())),
         store: None,
     }
 }
@@ -54,27 +57,30 @@ fn encrypted_store_survives_restart_and_rejects_a_changed_secret() {
     let secret = "0123456789abcdef0123456789abcdef";
     assert!(Store::new(path.clone(), "too-short").is_err());
     let store = Store::new(path.clone(), secret).unwrap();
+    let empty = store.load().unwrap();
     assert!(
-        store.load().unwrap().is_empty(),
+        empty.accounts.is_empty() && empty.sessions.is_empty(),
         "missing file is not an error"
     );
 
-    let mut sessions = HashMap::new();
-    sessions.insert(
-        "token-live".to_owned(),
-        Session {
-            key: "secret-api-key".to_owned(),
-            expires: now() + 600,
-        },
-    );
-    sessions.insert(
-        "token-stale".to_owned(),
-        Session {
-            key: "expired-api-key".to_owned(),
-            expires: now() - 1,
-        },
-    );
-    store.save(&sessions).unwrap();
+    let vault = Vault {
+        accounts: vec![
+            Account::new(
+                "reader".to_owned(),
+                "correct horse battery",
+                "secret-api-key".to_owned(),
+                Some("secret-hister-token".to_owned()),
+            )
+            .unwrap(),
+        ],
+        sessions: vec![
+            ("token-live".to_owned(), "reader".to_owned(), now() + 600),
+            ("token-stale".to_owned(), "reader".to_owned(), now() - 1),
+            // A session whose account is gone must not survive a reload.
+            ("token-orphan".to_owned(), "deleted".to_owned(), now() + 600),
+        ],
+    };
+    store.save(&vault).unwrap();
 
     let sealed = std::fs::read(&path).unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -82,20 +88,33 @@ fn encrypted_store_survives_restart_and_rejects_a_changed_secret() {
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    store.save(&sessions).unwrap();
+    store.save(&vault).unwrap();
     assert_ne!(
         sealed,
         std::fs::read(&path).unwrap(),
         "each save uses a fresh nonce"
     );
-    assert!(
-        !String::from_utf8_lossy(&sealed).contains("secret-api-key"),
-        "API key must not be readable on disk"
-    );
+    for secret_value in [
+        "secret-api-key",
+        "secret-hister-token",
+        "correct horse battery",
+    ] {
+        assert!(
+            !String::from_utf8_lossy(&sealed).contains(secret_value),
+            "{secret_value} must not be readable on disk"
+        );
+    }
 
     let restored = Store::new(path.clone(), secret).unwrap().load().unwrap();
-    assert_eq!(restored.len(), 1, "expired sessions are dropped on load");
-    assert_eq!(restored["token-live"].key, "secret-api-key");
+    assert_eq!(
+        restored.sessions.len(),
+        1,
+        "expired and orphaned sessions are dropped on load"
+    );
+    assert_eq!(restored.sessions[0].0, "token-live");
+    assert_eq!(restored.accounts[0].key, "secret-api-key");
+    assert!(restored.accounts[0].verify("correct horse battery"));
+    assert!(!restored.accounts[0].verify("wrong password"));
 
     let other = Store::new(path.clone(), "fedcba9876543210fedcba9876543210").unwrap();
     assert!(other.load().is_err(), "a different secret must not decrypt");
@@ -111,7 +130,7 @@ fn encrypted_store_survives_restart_and_rejects_a_changed_secret() {
 }
 
 #[tokio::test]
-async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
+async fn persistent_accounts_keep_users_separate_and_logout_survives_restart() {
     let mock = Router::new().route(
         "/api/v1/users/me",
         get(|headers: HeaderMap| async move {
@@ -127,12 +146,17 @@ async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
     let mut state = app(&format!("http://{address}/api/v1/"));
     state.store = Some(store.clone());
     let mut cookies = Vec::new();
-    for key in ["alice-key", "bob-key"] {
+    for (name, key) in [("alice", "alice-key"), ("bob", "bob-key")] {
         let response = router(state.clone())
-            .oneshot(request("POST", "/api/login", "", json!({"api_key": key})))
+            .oneshot(request(
+                "POST",
+                "/api/register",
+                "",
+                json!({"username": name, "password": "a-long-test-password", "api_key": key}),
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CREATED);
         cookies.push(
             response.headers()[header::SET_COOKIE]
                 .to_str()
@@ -141,7 +165,8 @@ async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
         );
     }
     let before = store.load().unwrap();
-    state.sessions = Arc::new(Mutex::new(store.load().unwrap()));
+    state.vault = Arc::new(Mutex::new(store.load().unwrap()));
+    // Each cookie still resolves to its own account's stored key.
     for (cookie, key) in cookies.iter().zip(["alice-key", "bob-key"]) {
         let response = router(state.clone())
             .oneshot(request("GET", "/api/me", cookie, Value::Null))
@@ -150,19 +175,25 @@ async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await["id"], format!("Bearer {key}"));
     }
-    for (token, session) in state.sessions.lock().unwrap().iter() {
-        assert_eq!(
-            session.expires, before[token].expires,
-            "restart must not extend expiry"
-        );
+    for (token, _, expires) in state.vault.lock().unwrap().sessions.iter() {
+        let original = before
+            .sessions
+            .iter()
+            .find(|(existing, _, _)| existing == token)
+            .unwrap();
+        assert_eq!(*expires, original.2, "restart must not extend expiry");
     }
+    // An unwritable store must fail the request instead of reporting success.
     let mut failing = state.clone();
     failing.store = Some(Arc::new(
         Store::new(path.join("missing/sessions.enc"), secret).unwrap(),
     ));
     for (route, body) in [
         ("logout", Value::Null),
-        ("login", json!({"api_key": "replacement-key"})),
+        (
+            "login",
+            json!({"username": "alice", "password": "a-long-test-password"}),
+        ),
     ] {
         let response = router(failing.clone())
             .oneshot(request("POST", &format!("/api/{route}"), &cookies[0], body))
@@ -170,27 +201,61 @@ async fn persistent_sessions_keep_users_separate_and_logout_survives_restart() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
-        assert_eq!(state.sessions.lock().unwrap().len(), 2);
-        assert_eq!(store.load().unwrap().len(), 2);
+        assert_eq!(state.vault.lock().unwrap().sessions.len(), 2);
+        assert_eq!(store.load().unwrap().sessions.len(), 2);
     }
     let response = router(state.clone())
         .oneshot(request("POST", "/api/logout", &cookies[0], Value::Null))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    state.sessions = Arc::new(Mutex::new(store.load().unwrap()));
+    state.vault = Arc::new(Mutex::new(store.load().unwrap()));
+    // Logout removed the session but kept the account and its stored keys.
+    assert_eq!(state.vault.lock().unwrap().accounts.len(), 2);
     let response = router(state.clone())
         .oneshot(request("GET", "/api/me", &cookies[0], Value::Null))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let response = router(state)
+    let response = router(state.clone())
         .oneshot(request("GET", "/api/me", &cookies[1], Value::Null))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // Signing back in needs only the password; the key stays server-side.
+    let response = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/login",
+            "",
+            json!({"username": "alice", "password": "a-long-test-password"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let response = router(state.clone())
+        .oneshot(request("GET", "/api/me", &cookie, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(json_body(response).await["id"], "Bearer alice-key");
     fs::remove_file(path).unwrap();
     server.abort();
+}
+
+#[test]
+fn setting_errors_name_the_variable_and_the_rejected_value() {
+    let message = setting("KARAKEEP_URL", "karakeep:3000", "Expected an HTTP(S) URL");
+    assert!(message.contains("KARAKEEP_URL"), "{message}");
+    assert!(message.contains("karakeep:3000"), "{message}");
+    assert!(message.contains("http://host:3000"), "{message}");
+    assert!(
+        setting("SEARCH_URL", "bad", "Bad").contains("{query}"),
+        "SEARCH_URL example must show the placeholder"
+    );
 }
 
 #[tokio::test]
@@ -290,7 +355,12 @@ async fn protects_private_routes_and_mutations() {
             .unwrap()
             .contains("frame-ancestors 'none'")
     );
-    let mut missing_header = request("POST", "/api/login", "", json!({"api_key":"test"}));
+    let mut missing_header = request(
+        "POST",
+        "/api/login",
+        "",
+        json!({"username":"reader","password":"a-long-test-password"}),
+    );
     missing_header.headers_mut().remove("x-karasearch-request");
     assert_eq!(
         router
@@ -301,7 +371,12 @@ async fn protects_private_routes_and_mutations() {
             .status(),
         StatusCode::FORBIDDEN
     );
-    let mut cross_site = request("POST", "/api/login", "", json!({"api_key":"test"}));
+    let mut cross_site = request(
+        "POST",
+        "/api/login",
+        "",
+        json!({"username":"reader","password":"a-long-test-password"}),
+    );
     cross_site
         .headers_mut()
         .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
@@ -314,13 +389,21 @@ async fn protects_private_routes_and_mutations() {
 #[tokio::test]
 async fn expired_session_is_removed() {
     let state = app("http://127.0.0.1:1/api/v1/");
-    state.sessions.lock().unwrap().insert(
-        "expired".into(),
-        Session {
-            key: "secret".into(),
-            expires: now() - 1,
-        },
-    );
+    {
+        let mut vault = state.vault.lock().unwrap();
+        vault.accounts.push(
+            Account::new(
+                "reader".into(),
+                "a-long-test-password",
+                "secret".into(),
+                None,
+            )
+            .unwrap(),
+        );
+        vault
+            .sessions
+            .push(("expired".into(), "reader".into(), now() - 1));
+    }
     let response = router(state.clone())
         .oneshot(request(
             "GET",
@@ -331,28 +414,52 @@ async fn expired_session_is_removed() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(state.sessions.lock().unwrap().is_empty());
+    // The expired session is dropped; the account it pointed at is not.
+    assert!(state.vault.lock().unwrap().sessions.is_empty());
+    assert_eq!(state.vault.lock().unwrap().accounts.len(), 1);
 }
 
 #[tokio::test]
-async fn validates_login_and_reports_unreachable_upstream() {
+async fn validates_credentials_and_reports_unreachable_upstream() {
     let router = router(app("http://127.0.0.1:1/api/v1/"));
+    // Bad usernames, short passwords, and unusable keys are all caught locally.
+    for body in [
+        json!({"username":"reader","password":"a-long-test-password","api_key":"\n"}),
+        json!({"username":"","password":"a-long-test-password","api_key":"key"}),
+        json!({"username":"bad name!","password":"a-long-test-password","api_key":"key"}),
+        json!({"username":"reader","password":"short","api_key":"key"}),
+        json!({"username":"reader","password":"a-long-test-password"}),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request("POST", "/api/register", "", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    // A well-formed request reports the unreachable upstream, not a local error.
     let response = router
         .clone()
-        .oneshot(request("POST", "/api/login", "", json!({"api_key":"\n"})))
+        .oneshot(request(
+            "POST",
+            "/api/register",
+            "",
+            json!({"username":"reader","password":"a-long-test-password","api_key":"valid-but-unreachable"}),
+        ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // Signing in as an account that does not exist must not reveal which half was wrong.
     let response = router
         .oneshot(request(
             "POST",
             "/api/login",
             "",
-            json!({"api_key":"valid-but-unreachable"}),
+            json!({"username":"ghost","password":"a-long-test-password"}),
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -388,29 +495,30 @@ async fn login_proxy_tagging_pinning_and_logout_match_karakeep_contract() {
     let mut state = app(&format!("http://{address}/api/v1/"));
     state.secure_cookie = true;
     let router = router(state.clone());
+    // A key the upstream rejects must not create an account.
     let denied = router
         .clone()
         .oneshot(request(
             "POST",
-            "/api/login",
+            "/api/register",
             "",
-            json!({"api_key":"wrong"}),
+            json!({"username":"reader","password":"a-long-test-password","api_key":"wrong"}),
         ))
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-    assert!(state.sessions.lock().unwrap().is_empty());
+    assert!(state.vault.lock().unwrap().accounts.is_empty());
     let response = router
         .clone()
         .oneshot(request(
             "POST",
-            "/api/login",
+            "/api/register",
             "",
-            json!({"api_key":"test-key"}),
+            json!({"username":"reader","password":"a-long-test-password","api_key":"test-key"}),
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let cookie = response.headers()[header::SET_COOKIE]
         .to_str()
         .unwrap()
@@ -418,7 +526,8 @@ async fn login_proxy_tagging_pinning_and_logout_match_karakeep_contract() {
     for attribute in ["HttpOnly", "SameSite=Strict", "Max-Age=43200", "Secure"] {
         assert!(cookie.contains(attribute));
     }
-    assert!(!cookie.contains("test-key"));
+    // Neither the upstream key nor the password may appear in the cookie.
+    assert!(!cookie.contains("test-key") && !cookie.contains("a-long-test-password"));
     assert_eq!(
         json_body(response).await,
         json!({"id":"user-1","name":"Test reader"})
@@ -510,5 +619,274 @@ async fn login_proxy_tagging_pinning_and_logout_match_karakeep_contract() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[tokio::test]
+async fn opensearch_descriptor_uses_the_request_host_and_rejects_junk() {
+    for (host, expected) in [
+        (
+            "kara.example:8787",
+            "http://kara.example:8787/?q={searchTerms}",
+        ),
+        ("evil\"><x", "http://localhost/?q={searchTerms}"),
+    ] {
+        let response = router(app("http://127.0.0.1:1"))
+            .oneshot(
+                Request::builder()
+                    .uri("/opensearch.xml")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 100_000).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(expected), "{host} produced {body}");
+    }
+}
+
+#[tokio::test]
+async fn one_password_unlocks_both_upstream_keys() {
+    let mock = Router::new()
+        .route(
+            "/api/v1/users/me",
+            get(|| async { Json(json!({"id": "user-1", "name": "Reader"})) }),
+        )
+        .route(
+            "/api/profile",
+            get(|headers: HeaderMap| async move {
+                if headers[header::AUTHORIZATION] == "Bearer hister-token" {
+                    Ok(Json(json!({"user_id": 7, "username": "reader"})))
+                } else {
+                    Err(StatusCode::FORBIDDEN)
+                }
+            }),
+        )
+        .route(
+            "/api/history",
+            get(
+                |headers: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                    Json(json!({
+                        "auth": headers[header::AUTHORIZATION].to_str().unwrap(),
+                        "opened": q.get("opened"),
+                        "documents": [{"url": "https://example.com/read", "title": "Read"}],
+                    }))
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let mut state = app(&format!("{base}/api/v1/"));
+    state.hister = Some(Url::parse(&format!("{base}/")).unwrap());
+
+    // A Hister token the server rejects must not create a half-configured account.
+    let rejected = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/register",
+            "",
+            json!({"username":"reader","password":"a-long-test-password","api_key":"kara-key","hister_token":"wrong"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert!(state.vault.lock().unwrap().accounts.is_empty());
+
+    let response = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/register",
+            "",
+            json!({"username":"reader","password":"a-long-test-password","api_key":"kara-key","hister_token":"hister-token"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let profile = json_body(response).await;
+    assert_eq!(profile["hister"]["username"], "reader");
+
+    // Registration is closed once an account exists.
+    let mut closed = state.clone();
+    closed.open_registration = false;
+    let second = router(closed)
+        .oneshot(request(
+            "POST",
+            "/api/register",
+            "",
+            json!({"username":"intruder","password":"a-long-test-password","api_key":"kara-key"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+
+    // The whole point: sign in with the password alone, reach both upstreams.
+    let wrong = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/login",
+            "",
+            json!({"username":"reader","password":"not-the-password"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let response = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/login",
+            "",
+            json!({"username":"reader","password":"a-long-test-password"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let karakeep = router(state.clone())
+        .oneshot(request("GET", "/api/me", &cookie, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(karakeep.status(), StatusCode::OK);
+
+    let history = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/api/history?opened=true",
+            &cookie,
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    let body = json_body(history).await;
+    assert_eq!(body["auth"], "Bearer hister-token");
+    assert_eq!(body["opened"], "true", "opened must reach Hister");
+
+    // Dropping the Hister token leaves history unavailable but Karakeep working.
+    let updated = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/keys",
+            &cookie,
+            json!({"api_key":"kara-key"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let denied = router(state.clone())
+        .oneshot(request("GET", "/api/history", &cookie, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::CONFLICT);
+    let still_fine = router(state.clone())
+        .oneshot(request("GET", "/api/me", &cookie, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(still_fine.status(), StatusCode::OK);
+
+    // No session at all is unauthorized, not a 404.
+    let anonymous = router(state.clone())
+        .oneshot(request("GET", "/api/history", "", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[tokio::test]
+async fn open_registration_admits_several_users_with_their_own_keys() {
+    let mock = Router::new().route(
+        "/api/v1/users/me",
+        get(|headers: HeaderMap| async move {
+            Json(json!({"id": headers[header::AUTHORIZATION].to_str().unwrap()}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let state = app(&format!("http://{address}/api/v1/"));
+
+    let mut cookies = Vec::new();
+    for (name, key) in [
+        ("alice", "alice-key"),
+        ("bob", "bob-key"),
+        ("carol", "carol-key"),
+    ] {
+        let response = router(state.clone())
+            .oneshot(request(
+                "POST",
+                "/api/register",
+                "",
+                json!({"username": name, "password": "a-long-test-password", "api_key": key}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{name} could not register"
+        );
+        cookies.push(
+            response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(state.vault.lock().unwrap().accounts.len(), 3);
+
+    // Concurrent sessions each proxy with their owner's key, never a shared one.
+    for (cookie, key) in cookies.iter().zip(["alice-key", "bob-key", "carol-key"]) {
+        let response = router(state.clone())
+            .oneshot(request("GET", "/api/me", cookie, Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["id"], format!("Bearer {key}"));
+    }
+
+    // An open server still keeps usernames unique and still offers registration.
+    let taken = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/register",
+            "",
+            json!({"username":"alice","password":"[API_KEY_c62b2c84d2a0]","api_key":"other-key"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(taken.status(), StatusCode::CONFLICT);
+
+    let config = router(state.clone())
+        .oneshot(request("GET", "/api/config", "", Value::Null))
+        .await
+        .unwrap();
+    let config = json_body(config).await;
+    assert_eq!(config["canRegister"], true);
+    assert_eq!(config["openRegistration"], true);
+
+    // Alice's key must not have been replaced by the rejected attempt.
+    let response = router(state.clone())
+        .oneshot(request("GET", "/api/me", &cookies[0], Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(json_body(response).await["id"], "Bearer alice-key");
     server.abort();
 }

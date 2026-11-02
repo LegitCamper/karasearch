@@ -2,13 +2,14 @@
 
 A small Rust homepage for a self-hosted Karakeep library. Axum serves the frontend and talks to Karakeep's REST API; no Node build, separate account database, or changes to Karakeep required.
 
-- Sign in with a personal Karakeep API key.
+- Create a Karasearch account, then sign in with a username and password your password manager can fill. It unlocks your stored Karakeep and Hister keys. Several people can each keep their own keys on one instance.
 - Search your library, browse tags, and load more results.
 - Pin links to a bookmark bar using Karakeep favourites.
 - Browse Karakeep lists as nested folders on the bar (`parentId` nesting, one click to open).
 - Live library search while typing, with a suggestion dropdown (first row is `your query (search)`).
 - Add/remove tags and save new links directly to Karakeep.
 - Customize the heading, theme (Paper, After hours, Catppuccin Latte/Frappe/Macchiato/Mocha, Dracula), compact layout, and search engines.
+- Show recently visited pages from [Hister](https://github.com/asciimoo/hister) on the front page, beside your bookmark bar.
 - Submit web searches to Private Search or any HTTP(S) search URL with a `{query}` placeholder. External search runs only on submit, not while typing.
 
 ## Run locally
@@ -21,20 +22,58 @@ SEARCH_URL='http://localhost:8080/search?q={query}&t=general' \
 cargo run
 ```
 
-Open `http://127.0.0.1:8787`. Create an API key in Karakeep's **Settings > API Keys**, then paste it into the login form. Give the key user/bookmark/tag read access and bookmark/tag write access for editing, if your Karakeep version supports scoped keys. Existing Karakeep email/password or OAuth login remains in Karakeep; this app does not copy its password database or impersonate its login form.
+Open `http://127.0.0.1:8787`. The first visit to an unclaimed server shows a **Create your account** form: pick a username and password, and paste your Karakeep API key (create one in Karakeep's **Settings > API Keys**). Give the key user/bookmark/tag read access and bookmark/tag write access for editing, if your Karakeep version supports scoped keys.
+
+After that, sign in with only the username and password. The upstream keys stay on the server, so your password manager stores one credential instead of two API keys. Change the stored keys later under **Customize > Connected accounts**.
+
+Karasearch accounts are its own, separate from Karakeep's. Existing Karakeep email/password or OAuth login remains in Karakeep; this app does not copy its password database or impersonate its login form.
 
 The Private Search default matches `../private-search`: port 8080, `/search?q=...&t=general`. Change its address in Customize if hosted elsewhere. Its URL must be reachable **from your browser**, unlike `KARAKEEP_URL`, which must be reachable **from the Rust server**.
 
 | Environment | Default | Purpose |
 | --- | --- | --- |
 | `KARAKEEP_URL` | `http://127.0.0.1:3000` | Karakeep base URL, without `/api/v1`; a base path is supported |
+| `HISTER_URL` | unset | Hister base URL, without `/api`; unset hides all Hister features |
 | `BIND_ADDR` | `127.0.0.1:8787` | Listener address |
 | `SEARCH_URL` | `http://localhost:8080/search?q={query}&t=general` | Initial external engine template |
 | `COOKIE_SECURE` | `false` | Set `true` behind HTTPS |
-| `SESSION_STORE` | unset | Optional encrypted session file; Compose sets `/data/sessions.enc` |
+| `SESSION_STORE` | unset | Encrypted account and session file; Compose sets `/data/sessions.enc`. **Without it, accounts vanish on restart.** |
+| `ALLOW_REGISTRATION` | `false` | Keep accepting new accounts after the first; required for a shared, multi-user instance |
 | `SESSION_SECRET` | unset | Stable random secret (at least 32 characters), required with `SESSION_STORE` |
 
 The binary reads environment variables, not `.env` files. Docker Compose reads `.env` for interpolation. Empty or unset `SEARCH_URL` uses the default. Existing browser preferences override `SEARCH_URL` after customization.
+
+## Hister
+
+Set `HISTER_URL` to a Hister instance reachable **from the Rust server** to add a visited-pages section to the front page. Leave it unset and nothing changes: the token field is hidden and `/api/history` returns 404.
+
+```sh
+KARAKEEP_URL=http://127.0.0.1:3000 \
+HISTER_URL=http://127.0.0.1:4433 \
+cargo run
+```
+
+Hister owns its own accounts; Karasearch only stores a token for one of them. On a Hister server with `user_handling: true`, an administrator creates accounts with `POST /api/users` and reads each access token from `GET /api/users/{id}/token`; a user can rotate their own with `POST /api/users/{id}/token`. On a single-user server, the token is `app.access_token` from the Hister config. Paste that token in once at registration, or later under **Customize > Connected accounts**.
+
+Keys are validated before they are stored: Karasearch calls Karakeep's `users/me` and Hister's `api/profile`, and registration fails if either rejects its key, so a half-configured account is never saved. Both keys are checked again at each sign-in, so a revoked key is reported at the login form instead of as a broken home page. An account without a Hister token works fine; the visited-pages section stays hidden and history requests return 409.
+
+The front page reads `GET /api/history?opened=true`, which Hister answers with pages you navigated to. Only the first page (up to 100 records, 24 shown) is loaded; there is no history pagination, search, or deletion here. Use Hister's own interface for those.
+
+**Session file format changed.** The store now holds accounts as well as sessions, so the encryption context moved to `v3`. An existing `SESSION_STORE` file from an earlier version will not decrypt, and startup stops with an error rather than discarding it silently. Delete that file once, then register again.
+
+## Accounts
+
+Karasearch accounts exist only to unlock the upstream keys it holds for you. There is no email, no password reset, and no admin console: lose the password and the fix is deleting the store file and registering again.
+
+Karasearch is multi-user: each account holds its own Karakeep key and its own Hister token, and sessions never share them. Accounts are capped at 256.
+
+Only the default is restrictive. The first registration on an empty store succeeds; afterwards registration returns 403 unless `ALLOW_REGISTRATION=true`, because an instance briefly reachable on a network should not be claimable by whoever loads it first. For a shared server, set `ALLOW_REGISTRATION=true` and leave it on; the login form then shows sign-in with a link to create an account. For a personal one, leave it unset, or turn it on only while adding people.
+
+Passwords must be 12-256 characters, and no composition rules are enforced; length and a password manager do more than forced punctuation. They are hashed with PBKDF2-HMAC-SHA256 at 600,000 rounds, with a unique 16-byte salt per account, and compared in constant time. Hashing is deliberately slow, which is why sign-in takes a moment.
+
+Password hashes and both upstream keys live in the same encrypted store as sessions. The keys must be recoverable to call Karakeep and Hister, so they are encrypted rather than hashed: anyone holding both `SESSION_SECRET` and the store file can read them. Accounts are capped at 256.
+
+This is a personal start page, not a hardened identity provider. There is no rate limiting on sign-in attempts; put a reverse proxy in front of it before exposing it to the internet.
 
 ## Health check
 
@@ -58,6 +97,8 @@ Keep the secret outside the session volume. Back up both separately; anyone with
 
 For native runs, create a private writable directory, set `SESSION_STORE` to a file inside it, and supply the same `SESSION_SECRET` on every run. Bind mounts must be writable by UID 10001. Run only one Karasearch process per session file; this is not a shared store for replicas. Leave `SESSION_STORE` unset for the simpler memory-only mode.
 
+`KARAKEEP_URL` needs the scheme. A bare `karakeep:3000` is rejected, because `karakeep:` parses as the URL scheme; use `http://karakeep:3000`. Startup errors name the variable and the value they rejected.
+
 Compose connects to Karakeep's host-published port 3000 through `host.docker.internal`. This requires that port to be reachable from the container network. If Karakeep is in another Compose stack, preferably join Karasearch to its Docker network and set `KARAKEEP_URL=http://<karakeep-service>:3000`. Do not use `localhost` to refer to another container. Change the port to match your setup. No Karakeep volumes or database files are mounted.
 
 The default port mapping is loopback-only. For LAN access, deliberately change the binding and place the app behind an HTTPS reverse proxy with `COOKIE_SECURE=true`. Do not send API keys over untrusted plain HTTP. This is a personal/local app, not a hardened public login service: add ingress rate limiting before public exposure.
@@ -74,11 +115,16 @@ DuckDuckGo | https://duckduckgo.com/?q={query}
 Google | https://www.google.com/search?q={query}
 ```
 
+### Browser-native search
+
+`GET /?q=<query>` runs a library search on load. If your library returns nothing, the page redirects to the first configured engine, so an unmatched query still lands on the web. `/opensearch.xml` advertises that template (built from the request `Host`; the scheme follows `COOKIE_SECURE`), and `index.html` links to it, so browsers can add Karasearch as a search engine and give it a keyword. Signing in is still required; an unauthenticated `/?q=...` shows the login form, then runs the query after login.
+
 Queries are URL-encoded before substitution. Search engines are not proxied. Bookmark URLs and labels are rendered without trusting HTML from Karakeep; there are no third-party fonts, favicons, scripts, or analytics requests.
 
 ## Deliberate limits
 
-- API keys stay server-side, encrypted on disk when `SESSION_STORE` is set, otherwise only in memory. Opaque HttpOnly/SameSite cookies expire after 12 hours. Without persistence, restart signs everyone out. Logout removes the session, not the upstream API key. Sessions are capped at 1,024. A new login replaces that browser's previous session.
+- Accounts and API keys stay server-side, encrypted on disk when `SESSION_STORE` is set, otherwise only in memory. Opaque HttpOnly/SameSite cookies expire after 12 hours. Without persistence, a restart deletes every account, not only sessions. Logout removes the session and leaves the account and its keys in place. Sessions are capped at 1,024 and accounts at 256. A new login replaces that browser's previous session.
+- No password reset, email, or account recovery. Deleting the store file is the only reset, and it discards every account.
 - Mutations require a custom same-origin header; no cross-origin API access is enabled. Upstream redirects are disabled to prevent forwarding credentials to another host. The upstream host is operator-configured, never supplied by the login form.
 - Preferences live in browser local storage, keyed by Karakeep user ID. They do not sync between devices. Favourites and tags do sync because Karakeep owns them. Pinning changes your Karakeep favourites, not a separate list.
 - Folders are read-only here: lists are created, renamed, and filled in Karakeep. Each folder loads its first 40 bookmarks on first open and caches them until refresh; smart lists work because Karakeep resolves the query.
@@ -98,4 +144,4 @@ node tests/frontend.mjs
 
 Rust tests use a loopback mock upstream to check authentication, protected routes, CSRF rejection, session expiry/logout, query encoding/pagination, and mutation payloads. They do not require a live Karakeep instance or credentials.
 
-For manual browser checks without touching a real library, start `node tests/mock-karakeep.mjs`, then run `KARAKEEP_URL=http://127.0.0.1:18787 BIND_ADDR=127.0.0.1:18788 cargo run` in another terminal. Visit `http://localhost:18788` and use the fixture key `test-key`. Fixture data is synthetic and resets when its process stops.
+For manual browser checks without touching a real library, start `node tests/mock-karakeep.mjs` and `node tests/mock-hister.mjs`, then run `KARAKEEP_URL=http://127.0.0.1:18787 HISTER_URL=http://127.0.0.1:18789 BIND_ADDR=127.0.0.1:18788 cargo run` in another terminal. Visit `http://localhost:18788`, register any username and password, and paste the fixture key `test-key` with the fixture token `test-hister-token`. Fixture data is synthetic and resets when its process stops.
